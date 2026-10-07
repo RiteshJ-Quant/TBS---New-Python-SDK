@@ -1,0 +1,6 @@
+kotak-neo-python/
+__pycache__/
+logs/
+master_scrips/
+scratch/
+venv/
