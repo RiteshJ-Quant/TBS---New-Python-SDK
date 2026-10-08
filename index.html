@@ -1549,10 +1549,18 @@
                         </div>
 
                         <form onsubmit="submitOMSManualOrder(event)">
-                            <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px;">
+                            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 20px;">
                                 <div class="form-field">
                                     <label class="field-label">TRADING SYMBOL</label>
                                     <input type="text" id="omsOrderSymbol" class="field-input" value="NIFTY26SEP24350CE" required placeholder="e.g. NIFTY26SEP24350CE">
+                                </div>
+
+                                <div class="form-field">
+                                    <label class="field-label">PRODUCT</label>
+                                    <select id="omsOrderProduct" class="field-select">
+                                        <option value="NRML">NRML (Normal Carrying)</option>
+                                        <option value="MIS">MIS (Intraday)</option>
+                                    </select>
                                 </div>
 
                                 <div class="form-field">
@@ -1756,6 +1764,7 @@
         async function submitOMSManualOrder(e) {
             e.preventDefault();
             const tradingSymbol = document.getElementById('omsOrderSymbol').value.trim();
+            const product = document.getElementById('omsOrderProduct') ? document.getElementById('omsOrderProduct').value : 'NRML';
             const transactionType = document.getElementById('omsOrderAction').value;
             const orderType = document.getElementById('omsOrderType').value;
             const quantity = parseInt(document.getElementById('omsOrderQty').value || 25);
@@ -1764,13 +1773,13 @@
                 const res = await fetch('/api/oms/place-order', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ tradingSymbol, transactionType, orderType, quantity, price: 0 })
+                    body: JSON.stringify({ tradingSymbol, product, transactionType, orderType, quantity, price: 0 })
                 });
                 const data = await res.json();
                 if (data.success) {
-                    alert(`Order Submitted to Kotak Neo!\nOrder ID: ${data.order.orderId}\nSymbol: ${data.order.symbol}\nExecuted Limit Price: ₹${data.order.price}`);
+                    alert(`Order Submitted to Kotak Neo!\nOrder ID: ${data.order.orderId}\nSymbol: ${data.order.symbol}\nProduct: ${data.order.product || product}\nExecuted Limit Price: ₹${data.order.price}`);
                 } else {
-                    alert("Order Submission Error.");
+                    alert("Order Submission Error: " + (data.message || "Unknown error"));
                 }
             } catch (err) {
                 console.error("Submit OMS Order Error:", err);
@@ -2718,7 +2727,12 @@
                                 ${escapeHtml(s.strategyExpiry)} <span style="background:${calculateDte(s.strategyExpiry) === 0 ? '#fef3c7' : '#e0f2fe'}; color:${calculateDte(s.strategyExpiry) === 0 ? '#d97706' : '#0284c7'}; padding:1px 6px; border-radius:8px; font-size:10px; font-weight:700; border:1px solid ${calculateDte(s.strategyExpiry) === 0 ? '#fde68a' : '#bae6fd'};">${calculateDte(s.strategyExpiry)} DTE</span>
                             </div>` : ''}
                     </td>
-                    <td>${escapeHtml(s.broker || 'Kotak Neo')}</td>
+                    <td>
+                        ${escapeHtml(s.broker || 'Kotak Neo')}
+                        <div style="font-size:10px; color:${(s.productCode && s.productCode.includes('NRML')) ? '#0284c7' : '#d97706'}; font-weight:700;">
+                            ${(s.productCode && s.productCode.includes('NRML')) ? 'NRML' : 'MIS'}
+                        </div>
+                    </td>
                     <td>${s.lotsPairs || 1}</td>
                     <td>${s.batches || 1}</td>
                     <td>${s.entryTime || '09:20'}</td>
@@ -2790,7 +2804,12 @@
                                 ${escapeHtml(s.strategyExpiry)} <span style="background:${calculateDte(s.strategyExpiry) === 0 ? '#fef3c7' : '#e0f2fe'}; color:${calculateDte(s.strategyExpiry) === 0 ? '#d97706' : '#0284c7'}; padding:1px 6px; border-radius:8px; font-size:10px; font-weight:700; border:1px solid ${calculateDte(s.strategyExpiry) === 0 ? '#fde68a' : '#bae6fd'};">${calculateDte(s.strategyExpiry)} DTE</span>
                             </div>` : ''}
                     </td>
-                    <td>${escapeHtml(s.broker || 'Kotak Neo')}</td>
+                    <td>
+                        ${escapeHtml(s.broker || 'Kotak Neo')}
+                        <div style="font-size:10px; color:${(s.productCode && s.productCode.includes('NRML')) ? '#0284c7' : '#d97706'}; font-weight:700;">
+                            ${(s.productCode && s.productCode.includes('NRML')) ? 'NRML' : 'MIS'}
+                        </div>
+                    </td>
                     <td>${s.lotsPairs || 1}</td>
                     <td>${s.batches || 1}</td>
                     <td>${s.entryTime || '09:20'}</td>

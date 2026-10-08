@@ -1064,6 +1064,16 @@ def resolve_leg_strike_and_price(sym_base: str, leg: dict, strat_id: str = None,
     return strike, option_ltp, limit_price, trd_sym
 
 
+def get_strategy_product_code(strat: dict) -> str:
+    """Returns normalized broker product code: 'NRML' or 'MIS'."""
+    if not isinstance(strat, dict):
+        return "MIS"
+    raw = str(strat.get("productCode", "")).upper()
+    if "NRML" in raw or "NORMAL" in raw:
+        return "NRML"
+    return "MIS"
+
+
 def run_prewarm_fast_loop(strat_id: str, duration_sec: int = 20):
     """
     Runs a 250ms fast loop for pre-warming (20 seconds prior to entry time).
@@ -1224,7 +1234,8 @@ def place_oms_manual_order():
     action = data.get("transactionType", "BUY").strip().upper()
     order_type = data.get("orderType", "L").strip().upper()
     quantity = int(data.get("quantity", 1))
-    product = data.get("product", "MIS").strip().upper()
+    raw_prod = data.get("product", "MIS")
+    product = "NRML" if "NRML" in str(raw_prod).upper() else "MIS"
     user_price = float(data.get("price", 0) or 0)
     
     # Get current LTP from market cache or fallback
@@ -1238,15 +1249,16 @@ def place_oms_manual_order():
     if order_type in ["L", "LIMIT"]:
         if user_price <= 0:
             final_price = calculate_limit_order_price(ltp, action)
-        print(f"[*] Manual OMS Limit Order: LTP={ltp}, Action={action}, Final Limit Price={final_price}")
+        print(f"[*] Manual OMS Limit Order: Symbol={symbol}, Action={action}, Product={product}, LTP={ltp}, Final Limit Price={final_price}")
 
     client = SESSION_DATA.get("client")
     order_id = f"OMS-{uuid.uuid4().hex[:6].upper()}"
 
     if client is not None:
         try:
+            exchange_seg = "bse_fo" if ("SENSEX" in symbol or "BANKEX" in symbol) else "nse_fo"
             res = client.place_order(
-                exchange_segment="nse_fo",
+                exchange_segment=exchange_seg,
                 trading_symbol=symbol,
                 transaction_type="B" if action in ["BUY", "B"] else "S",
                 product=product,
@@ -1258,6 +1270,13 @@ def place_oms_manual_order():
             if isinstance(res, dict) and (res.get("nOrdNo") or res.get("stat") == "Ok"):
                 order_id = res.get("nOrdNo", order_id)
                 print(f"[+] Kotak Neo OMS Limit Order Placed! Order ID: {order_id}")
+            elif isinstance(res, dict) and (res.get("stat") == "Not_Ok" or "errMsg" in res):
+                err = res.get("errMsg", "Broker rejected order")
+                print(f"[-] Kotak Neo OMS Order Rejected: {err}")
+                return jsonify({
+                    "success": False,
+                    "message": f"Kotak Neo Rejected Order: {err}"
+                }), 400
         except Exception as e:
             print(f"[-] Kotak Neo OMS Order Exception: {e}")
 
@@ -1269,6 +1288,7 @@ def place_oms_manual_order():
             "symbol": symbol,
             "action": action,
             "orderType": order_type,
+            "product": product,
             "quantity": quantity,
             "price": final_price,
             "ltp": ltp
@@ -1496,7 +1516,7 @@ def create_tbs_strategy():
     STRATEGIES_STORE.append(new_strat)
     dte_val = calculate_dte(new_strat.get("strategyExpiry", ""))
     dte_suffix = f" ({dte_val} DTE)" if new_strat.get("strategyExpiry") else ""
-    log_system_event(f"[STRATEGY CREATED] '{new_strat['name']}' | Symbol: {new_strat['symbol']} | Expiry: {new_strat['strategyExpiry']}{dte_suffix} | Entry: {new_strat['entryTime']} | Exit: {new_strat['exitTime']} | SL: {new_strat['sl']} | Strike: {new_strat['strikeSelection']}", "SUCCESS")
+    log_system_event(f"[STRATEGY CREATED] '{new_strat['name']}' | Symbol: {new_strat['symbol']} | Product: {get_strategy_product_code(new_strat)} | Expiry: {new_strat['strategyExpiry']}{dte_suffix} | Entry: {new_strat['entryTime']} | Exit: {new_strat['exitTime']} | SL: {new_strat['sl']} | Strike: {new_strat['strikeSelection']}", "SUCCESS")
 
     return jsonify({"success": True, "message": "Strategy saved successfully!", "strategy": new_strat})
 
@@ -1525,6 +1545,7 @@ def manual_entry_tbs_strategy():
     lots = int(target_strat.get("lotsPairs", 1))
     lot_sz = get_index_lot_size(sym_base)
     tot_qty = str(lots * lot_sz)
+    strat_prod = get_strategy_product_code(target_strat)
 
     if client is not None:
         try:
@@ -1537,12 +1558,12 @@ def manual_entry_tbs_strategy():
                 symbol_name = trd_sym or f"{sym_base}26SEP{strike}{opt_type_code}"
                 leg_action = leg.get("position", "Buy").upper()
                 tx_type = "B" if leg_action in ["BUY", "B"] else "S"
-                print(f"[*] Placing Manual Desk Limit Order: {symbol_name}, Action={leg_action}, Qty={tot_qty}, Option LTP={option_ltp}, Limit Price={limit_price}...")
+                print(f"[*] Placing Manual Desk Limit Order: {symbol_name}, Action={leg_action}, Qty={tot_qty}, Product={strat_prod}, Option LTP={option_ltp}, Limit Price={limit_price}...")
                 res = client.place_order(
                     exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
                     trading_symbol=symbol_name,
                     transaction_type=tx_type,
-                    product="MIS",
+                    product=strat_prod,
                     order_type="L",
                     quantity=tot_qty,
                     price=str(limit_price),
@@ -1700,8 +1721,9 @@ def execute_strategy_entry(target_strat: dict) -> dict:
     lot_sz = get_index_lot_size(sym_base)
     tot_qty = str(lots * lot_sz)
     legs = target_strat.get("legs", [{}])
+    strat_prod = get_strategy_product_code(target_strat)
 
-    log_system_event(f"[ENTRY INITIATED] Strategy '{target_strat['name']}' ({sym_base}) | Legs: {len(legs)} | Total Lots: {lots} ({tot_qty} Qty)", "INFO")
+    log_system_event(f"[ENTRY INITIATED] Strategy '{target_strat['name']}' ({sym_base}) | Product: {strat_prod} | Legs: {len(legs)} | Total Lots: {lots} ({tot_qty} Qty)", "INFO")
 
     # Check for configured Entry Delay (Seconds, 0-50)
     delay_sec = int(target_strat.get("delayEntry", 0) or 0)
@@ -1734,14 +1756,14 @@ def execute_strategy_entry(target_strat: dict) -> dict:
                 leg_action = leg.get("position", "Sell").upper()
                 tx_type = "B" if leg_action in ["BUY", "B"] else "S"
                 
-                log_msg = f"[ENTRY ORDER SUBMITTED] Leg #{idx+1}/{len(legs)}: Placing Limit Order for {symbol_name} ({leg_action}, Qty: {tot_qty}, LTP: ₹{leg_ltp:.2f}, Limit: ₹{leg_limit:.2f})"
+                log_msg = f"[ENTRY ORDER SUBMITTED] Leg #{idx+1}/{len(legs)}: Placing Limit Order for {symbol_name} ({leg_action}, Qty: {tot_qty}, Product: {strat_prod}, LTP: ₹{leg_ltp:.2f}, Limit: ₹{leg_limit:.2f})"
                 log_system_event(log_msg, "INFO")
 
                 res = client.place_order(
                     exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
                     trading_symbol=symbol_name,
                     transaction_type=tx_type,
-                    product="MIS",
+                    product=strat_prod,
                     order_type="L",
                     quantity=tot_qty,
                     price=str(leg_limit),
@@ -1792,13 +1814,13 @@ def execute_strategy_entry(target_strat: dict) -> dict:
                         sl_trigger = round(max(0.05, sl_trigger), 2)
                         sl_limit = round(max(0.05, sl_limit), 2)
 
-                        log_system_event(f"[STOPLOSS ORDER SUBMITTED] Leg #{idx+1} ({symbol_name}): {sl_tx_type} | Trigger: ₹{sl_trigger:.2f} | Limit: ₹{sl_limit:.2f}", "INFO")
+                        log_system_event(f"[STOPLOSS ORDER SUBMITTED] Leg #{idx+1} ({symbol_name}): {sl_tx_type} | Product: {strat_prod} | Trigger: ₹{sl_trigger:.2f} | Limit: ₹{sl_limit:.2f}", "INFO")
 
                         sl_res = client.place_order(
                             exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
                             trading_symbol=symbol_name,
                             transaction_type=sl_tx_type,
-                            product="MIS",
+                            product=strat_prod,
                             order_type="SL",
                             quantity=tot_qty,
                             price=str(sl_limit),
@@ -2101,9 +2123,10 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
     default_leg_qty = lots * lot_sz
     legs = target_strat.get("legs", [])
     client = SESSION_DATA.get("client")
+    strat_prod = get_strategy_product_code(target_strat)
 
     log_system_event(
-        f"[EXIT CYCLE INITIATED] Strategy '{target_strat['name']}' | Trigger: {reason} | Commencing 3-step square-off sequence across {len(legs)} legs...",
+        f"[EXIT CYCLE INITIATED] Strategy '{target_strat['name']}' | Trigger: {reason} | Product: {strat_prod} | Commencing 3-step square-off sequence across {len(legs)} legs...",
         "WARN"
     )
 
@@ -2371,7 +2394,7 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
                     exchange_segment=seg,
                     trading_symbol=leg_sym,
                     transaction_type=close_tx_type,
-                    product="MIS",
+                    product=strat_prod,
                     order_type="L",
                     quantity=str(net_qty),
                     price=str(limit_price),
