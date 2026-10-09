@@ -2322,22 +2322,21 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
     2. Queries current price for active strategy contracts (via broker quotes / live feed).
     3. Places Limit Orders (order_type='L') to close net quantities of the remaining legs, squaring off positions.
     """
-    was_executed = target_strat.get("isExecuted", False) or target_strat.get("status") == "ACTIVE"
-
-    if "STOPLOSS" in reason.upper():
-        target_strat["status"] = "STOPLOSS_HIT"
-    else:
-        target_strat["status"] = "EXITED"
-    target_strat["isExecuted"] = False
-    target_strat["exitedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    target_strat["exitReason"] = reason
+    was_executed = target_strat.get("isExecuted", False) or target_strat.get("status") in ["ACTIVE", "EXIT_PARTIAL", "EXITING"]
 
     if not was_executed:
+        target_strat["status"] = "EXITED"
+        target_strat["isExecuted"] = False
+        target_strat["exitedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        target_strat["exitReason"] = reason
         log_system_event(
             f"Strategy '{target_strat['name']}' stopped before entry execution ({reason}). No broker orders placed.",
             "INFO"
         )
         return target_strat
+
+    target_strat["status"] = "EXITING"
+    target_strat["exitReason"] = reason
 
     sym_base = target_strat.get("symbol", "NIFTY")
     lots = int(target_strat.get("lotsPairs", 1))
@@ -2547,7 +2546,7 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
 
     total_realized_pnl = 0.0
 
-    for idx, leg in enumerate(legs):
+    def close_single_leg(idx, leg):
         leg_sym = leg.get("executedSymbol", "")
         leg_pos = leg.get("position", "Sell").upper()
         leg_lots = int(leg.get("lots", lots))
@@ -2563,7 +2562,7 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
         leg_already_closed = (
             leg.get("slHit", False) or
             leg.get("slStatus") == "COMPLETE" or
-            leg.get("isClosed", False) or
+            (leg.get("isClosed", False) and not leg.get("exitFailed", False)) or
             leg.get("isSquaredOff", False)
         )
 
@@ -2572,6 +2571,7 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
             if b_net != 0:
                 net_qty = abs(b_net)
                 close_tx_type = "S" if b_net > 0 else "B"
+                leg_already_closed = False
             else:
                 net_qty = 0
                 leg_already_closed = True
@@ -2587,16 +2587,16 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
         else:
             leg_pnl = (exit_price - entry_price) * configured_qty
         leg["realizedPnL"] = round(leg_pnl, 2)
-        total_realized_pnl += leg_pnl
 
         # If net quantity is 0, this leg has already been squared off
         if net_qty <= 0 or leg_already_closed:
             leg["isClosed"] = True
+            leg["exitFailed"] = False
             log_system_event(
-                f"[EXIT STEP 3/3: LEG SQUARED-OFF] Leg #{idx+1} ({leg_sym}): Net open quantity is 0 (already closed via Stoploss/Trade). Skipping order placement. P&L: {'+' if leg_pnl>=0 else ''}\u20b9{leg_pnl:.2f}",
+                f"[EXIT STEP 3/3: LEG SQUARED-OFF] Leg #{idx+1} ({leg_sym}): Net open quantity is 0 (already closed via Stoploss/Trade). Skipping order placement. P&L: {'+' if leg_pnl>=0 else ''}₹{leg_pnl:.2f}",
                 "INFO"
             )
-            continue
+            return (leg_pnl, True)
 
         # Remaining net quantity exists -> Place Limit Order to Square Off
         limit_price = calculate_exit_limit_order_price(exit_price, close_tx_type)
@@ -2606,58 +2606,119 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
             seg = SYMBOL_TO_TOKEN_MAP[leg_sym][1]
 
         log_system_event(
-            f"[EXIT STEP 3/3: SQUARE-OFF ORDER] Leg #{idx+1} ({leg_sym}): Placing Limit Order (L) to close net quantity {net_qty} ({action_label} @ Limit \u20b9{limit_price:.2f}, LTP: \u20b9{exit_price:.2f})...",
+            f"[EXIT STEP 3/3: SQUARE-OFF ORDER] Leg #{idx+1} ({leg_sym}): Placing Limit Order (L) to close net quantity {net_qty} ({action_label} @ Limit ₹{limit_price:.2f}, LTP: ₹{exit_price:.2f})...",
             "WARN"
         )
 
         if client is not None:
-            try:
-                res = client.place_order(
-                    exchange_segment=seg,
-                    trading_symbol=leg_sym,
-                    transaction_type=close_tx_type,
-                    product=strat_prod,
-                    order_type="L",
-                    quantity=str(net_qty),
-                    price=str(limit_price),
-                    validity="DAY"
+            success = False
+            for attempt in range(1, 3):
+                try:
+                    res = client.place_order(
+                        exchange_segment=seg,
+                        trading_symbol=leg_sym,
+                        transaction_type=close_tx_type,
+                        product=strat_prod,
+                        order_type="L",
+                        quantity=str(net_qty),
+                        price=str(limit_price),
+                        validity="DAY"
+                    )
+                    if isinstance(res, dict) and (res.get("nOrdNo") or res.get("stat") == "Ok"):
+                        ord_id = res.get("nOrdNo") or res.get("result")
+                        leg["exitOrderNo"] = str(ord_id)
+                        leg["isClosed"] = True
+                        leg["exitFailed"] = False
+                        log_system_event(
+                            f"[EXIT ORDER FILLED] Leg #{idx+1} ({leg_sym}) squared off successfully! Broker Order: #{ord_id}",
+                            "SUCCESS"
+                        )
+                        success = True
+                        break
+                    elif isinstance(res, dict) and (res.get("stat") == "Not_Ok" or res.get("stCode") == 100008):
+                        log_system_event(
+                            f"KOTAK API SQUARE OFF REJECTED: 401 Unauthorized (stCode: 100008). Session token expired!",
+                            "ERROR"
+                        )
+                        break
+                    else:
+                        log_system_event(f"[EXIT ORDER NOTICE] Leg #{idx+1} ({leg_sym}) Attempt #{attempt}: {res}", "WARN")
+                except Exception as e:
+                    log_system_event(f"Live Broker Square Off Order Exception for {leg_sym} (Attempt #{attempt}): {e}", "ERROR")
+                    # Check whether order was accepted by broker despite the HTTP timeout
+                    time.sleep(1.0)
+                    try:
+                        pos_check = client.positions()
+                        p_list = pos_check.get("data") if isinstance(pos_check, dict) and isinstance(pos_check.get("data"), list) else []
+                        for cp in p_list:
+                            if cp.get("trdSym") == leg_sym:
+                                cq = int(float(cp.get("cfBuyQty", 0))) + int(float(cp.get("flBuyQty", 0))) - int(float(cp.get("cfSellQty", 0))) - int(float(cp.get("flSellQty", 0)))
+                                if "netQty" in cp and cp.get("netQty") is not None:
+                                    cq = int(float(cp["netQty"]))
+                                if cq == 0:
+                                    leg["isClosed"] = True
+                                    leg["exitFailed"] = False
+                                    log_system_event(f"[EXIT CONFIRMED] Leg #{idx+1} ({leg_sym}) verified closed on broker positions despite timeout!", "SUCCESS")
+                                    success = True
+                                    break
+                    except Exception:
+                        pass
+                    if success:
+                        break
+
+            if not success:
+                leg["isClosed"] = False
+                leg["exitFailed"] = True
+                log_system_event(
+                    f"[CRITICAL ERROR] Leg #{idx+1} ({leg_sym}) FAILED to square off due to broker timeout/rejection! Position is STILL OPEN. Please square off via Manual Desk!",
+                    "ERROR"
                 )
-                if isinstance(res, dict) and (res.get("nOrdNo") or res.get("stat") == "Ok"):
-                    ord_id = res.get("nOrdNo") or res.get("result")
-                    leg["exitOrderNo"] = str(ord_id)
-                    leg["isClosed"] = True
-                    log_system_event(
-                        f"[EXIT ORDER FILLED] Leg #{idx+1} ({leg_sym}) squared off successfully! Broker Order: #{ord_id}",
-                        "SUCCESS"
-                    )
-                elif isinstance(res, dict) and (res.get("stat") == "Not_Ok" or res.get("stCode") == 100008):
-                    log_system_event(
-                        f"KOTAK API SQUARE OFF REJECTED: 401 Unauthorized (stCode: 100008). Session token expired!",
-                        "ERROR"
-                    )
-                    leg["isClosed"] = True
-                else:
-                    leg["isClosed"] = True
-                    log_system_event(f"[EXIT ORDER NOTICE] Leg #{idx+1}: {res}", "INFO")
-            except Exception as e:
-                log_system_event(f"Live Broker Square Off Order Exception for {leg_sym}: {e}", "ERROR")
-                leg["isClosed"] = True
+                return (leg_pnl, False)
+            return (leg_pnl, True)
         else:
             # Paper trading / simulation mode
             leg["exitOrderNo"] = f"SIM-EXIT-{idx+1}"
             leg["isClosed"] = True
+            leg["exitFailed"] = False
             log_system_event(
-                f"[SIMULATED SQUARE-OFF] Leg #{idx+1} ({leg_sym}): Squared off {net_qty} Qty ({action_label}) @ \u20b9{limit_price:.2f} (LTP: \u20b9{exit_price:.2f}). P&L: {'+' if leg_pnl>=0 else ''}\u20b9{leg_pnl:.2f}",
+                f"[SIMULATED SQUARE-OFF] Leg #{idx+1} ({leg_sym}): Squared off {net_qty} Qty ({action_label}) @ ₹{limit_price:.2f} (LTP: ₹{exit_price:.2f}). P&L: {'+' if leg_pnl>=0 else ''}₹{leg_pnl:.2f}",
                 "SUCCESS"
             )
+            return (leg_pnl, True)
+
+    num_workers = min(4, max(1, len(legs)))
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(close_single_leg, idx, leg) for idx, leg in enumerate(legs)]
+        for fut in futures:
+            try:
+                leg_pnl_val, is_closed_val = fut.result()
+                total_realized_pnl += leg_pnl_val
+            except Exception as fe:
+                log_system_event(f"Square-off worker error: {fe}", "ERROR")
 
     target_strat["finalMTM"] = round(total_realized_pnl, 2)
     target_strat["liveMTM"] = round(total_realized_pnl, 2)
     sign = "+" if total_realized_pnl >= 0 else "-"
-    log_system_event(
-        f"[EXIT CYCLE COMPLETE] Strategy '{target_strat['name']}' fully squared off! Final Realized P&L: {sign}\u20b9{abs(total_realized_pnl):.2f} (Reason: {reason})",
-        "SUCCESS"
-    )
+
+    all_closed = all(leg.get("isClosed", False) for leg in legs)
+    if all_closed:
+        if "STOPLOSS" in reason.upper():
+            target_strat["status"] = "STOPLOSS_HIT"
+        else:
+            target_strat["status"] = "EXITED"
+        target_strat["isExecuted"] = False
+        target_strat["exitedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_system_event(
+            f"[EXIT CYCLE COMPLETE] Strategy '{target_strat['name']}' fully squared off! Final Realized P&L: {sign}₹{abs(total_realized_pnl):.2f} (Reason: {reason})",
+            "SUCCESS"
+        )
+    else:
+        target_strat["status"] = "EXIT_PARTIAL"
+        target_strat["isExecuted"] = True
+        log_system_event(
+            f"[EXIT CYCLE INCOMPLETE] Strategy '{target_strat['name']}' has UNCLOSED legs due to broker timeout! Status: EXIT_PARTIAL. Position remains active. Re-click Stop / Square Off to retry.",
+            "ERROR"
+        )
     return target_strat
 
 
