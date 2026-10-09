@@ -676,7 +676,9 @@ def get_broker_status():
 def calculate_limit_order_price(ltp: float, action: str) -> float:
     """
     Calculates entry price for a Limit Order (order_type='L') via Kotak Neo.
-    Formula: Price = LTP +/- entry_limit_offset
+    Formula:
+    - BUY:  Price = LTP + entry_limit_offset (marketable buy up to LTP + offset for immediate fill)
+    - SELL: Price = max(0.05, LTP - entry_limit_offset) (marketable sell down to LTP - offset for immediate fill)
     """
     offset_type = PROFILE_SETTINGS.get("omsLimitOffsetType", "Points (₹)")
     offset_val = float(PROFILE_SETTINGS.get("omsLimitOffsetValue", 0.5))
@@ -688,9 +690,9 @@ def calculate_limit_order_price(ltp: float, action: str) -> float:
 
     action_upper = action.strip().upper()
     if action_upper in ["BUY", "B"]:
-        price = ltp - calc_offset
-    else:
         price = ltp + calc_offset
+    else:
+        price = ltp - calc_offset
 
     return round(max(0.05, price), 2)
 
@@ -702,7 +704,7 @@ def calculate_exit_limit_order_price(ltp: float, close_action: str) -> float:
     - To close short (BUY): Limit Price = LTP + offset (marketable buy up to LTP + offset)
     - To close long (SELL): Limit Price = max(0.05, LTP - offset) (marketable sell down to LTP - offset)
     """
-    offset_type = PROFILE_SETTINGS.get("omsLimitOffsetType", "Points (\u20b9)")
+    offset_type = PROFILE_SETTINGS.get("omsLimitOffsetType", "Points (₹)")
     offset_val = float(PROFILE_SETTINGS.get("omsLimitOffsetValue", 0.5))
 
     if "Percent" in offset_type:
@@ -717,6 +719,43 @@ def calculate_exit_limit_order_price(ltp: float, close_action: str) -> float:
         price = ltp - calc_offset
 
     return round(max(0.05, price), 2)
+
+
+def calculate_sl_prices(entry_price: float, leg_action: str, sl_val: float, sl_type: str, trigger_limit_diff: float = 1.0, tick_size: float = 0.05) -> tuple:
+    """
+    Calculates (sl_trigger, sl_limit, sl_tx_type) for a matching Stop-Loss order (order_type='SL'):
+    - Percentage: Entry Price +/- (Entry Price * SL%)
+    - Points: Entry Price +/- SL Points
+    - A limit margin is added above (for SELL) / below (for BUY) trigger price (trigger_limit_diff)
+      to guarantee immediate fill even in volatile market conditions.
+    - All prices are strictly aligned to the broker's 0.05 tick size.
+    """
+    is_short = str(leg_action).strip().upper() in ["SELL", "S"]
+    sl_v = float(sl_val or 0)
+
+    if "Percent" in str(sl_type) or "%" in str(sl_type):
+        sl_points = entry_price * (sl_v / 100.0)
+    else:
+        sl_points = sl_v
+
+    if is_short:
+        # Short position: SL triggers when market rises.
+        # SL order is a BUY (B) to close short.
+        sl_trigger = entry_price + sl_points
+        sl_limit = sl_trigger + float(trigger_limit_diff or 1.0)
+        sl_tx_type = "B"
+    else:
+        # Long position: SL triggers when market drops.
+        # SL order is a SELL (S) to close long.
+        sl_trigger = entry_price - sl_points
+        sl_limit = max(0.05, sl_trigger - float(trigger_limit_diff or 1.0))
+        sl_tx_type = "S"
+
+    # Align to 0.05 tick size
+    sl_trigger = round(round(max(0.05, sl_trigger) / tick_size) * tick_size, 2)
+    sl_limit = round(round(max(0.05, sl_limit) / tick_size) * tick_size, 2)
+
+    return sl_trigger, sl_limit, sl_tx_type
 
 
 INDEX_STRIKE_STEPS: Dict[str, int] = {
@@ -1628,6 +1667,42 @@ def manual_entry_tbs_strategy():
                 if isinstance(res, dict) and (res.get("nOrdNo") or res.get("stat") == "Ok"):
                     order_ref = res.get("nOrdNo", order_ref)
                     print(f"[+] Manual Desk Limit Order Executed with Kotak Neo! Order No: {order_ref}")
+                    leg["executedSymbol"] = symbol_name
+                    leg["executedStrike"] = strike
+                    leg["executedEntryPrice"] = option_ltp
+                    leg["executedOptionType"] = opt_type_code
+
+                    # Submit matching Stoploss order if enabled
+                    sl_enable = leg.get("slEnable", True)
+                    sl_val = float(leg.get("slValue", 0) or 0)
+                    sl_type = str(leg.get("slType", "Points (Pts)"))
+                    if sl_enable and sl_val > 0:
+                        trigger_limit_diff = float(PROFILE_SETTINGS.get("triggerLimitDiff", 1.0))
+                        sl_trigger, sl_limit, sl_tx_type = calculate_sl_prices(
+                            entry_price=option_ltp,
+                            leg_action=leg_action,
+                            sl_val=sl_val,
+                            sl_type=sl_type,
+                            trigger_limit_diff=trigger_limit_diff
+                        )
+                        sl_res = client.place_order(
+                            exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
+                            trading_symbol=symbol_name,
+                            transaction_type=sl_tx_type,
+                            product=strat_prod,
+                            order_type="SL",
+                            quantity=tot_qty,
+                            price=str(sl_limit),
+                            trigger_price=str(sl_trigger),
+                            validity="DAY"
+                        )
+                        if isinstance(sl_res, dict) and (sl_res.get("nOrdNo") or sl_res.get("result")):
+                            sl_no = str(sl_res.get("nOrdNo") or sl_res.get("result"))
+                            leg["slOrderNo"] = sl_no
+                            leg["slTriggerPrice"] = sl_trigger
+                            leg["slLimitPrice"] = sl_limit
+                            leg["slStatus"] = "PENDING"
+                            log_system_event(f"[MANUAL DESK SL CONFIRMED] Leg: Kotak Neo SL Order No: {sl_no} | Trigger: ₹{sl_trigger:.2f} | Limit: ₹{sl_limit:.2f}", "SUCCESS")
         except Exception as e:
             print(f"[-] Manual Desk Order Placement Notice: {e}")
 
@@ -1848,27 +1923,13 @@ def execute_strategy_entry(target_strat: dict) -> dict:
 
                     if sl_enable and sl_val > 0:
                         entry_price = leg_ltp
-
-                        # Calculate SL Trigger Price & SL Limit Price
-                        if leg_action in ["SELL", "S"]:
-                            if "Percent" in sl_type or "%" in sl_type:
-                                sl_trigger = entry_price + (entry_price * (sl_val / 100.0))
-                            else:
-                                sl_trigger = entry_price + sl_val
-                            
-                            sl_limit = sl_trigger + trigger_limit_diff
-                            sl_tx_type = "B"
-                        else:
-                            if "Percent" in sl_type or "%" in sl_type:
-                                sl_trigger = entry_price - (entry_price * (sl_val / 100.0))
-                            else:
-                                sl_trigger = entry_price - sl_val
-                            
-                            sl_limit = max(0.05, sl_trigger - trigger_limit_diff)
-                            sl_tx_type = "S"
-
-                        sl_trigger = round(max(0.05, sl_trigger), 2)
-                        sl_limit = round(max(0.05, sl_limit), 2)
+                        sl_trigger, sl_limit, sl_tx_type = calculate_sl_prices(
+                            entry_price=entry_price,
+                            leg_action=leg_action,
+                            sl_val=sl_val,
+                            sl_type=sl_type,
+                            trigger_limit_diff=trigger_limit_diff
+                        )
 
                         log_system_event(f"[STOPLOSS ORDER SUBMITTED] Leg #{idx+1} ({symbol_name}): {sl_tx_type} | Product: {strat_prod} | Trigger: ₹{sl_trigger:.2f} | Limit: ₹{sl_limit:.2f}", "INFO")
 
@@ -1914,11 +1975,25 @@ def execute_strategy_entry(target_strat: dict) -> dict:
             leg["executedSymbol"] = symbol_name
             leg["executedStrike"] = leg_strike
             leg["executedOptionType"] = opt_type_code
-            leg["slOrderNo"] = f"SIM-SL-{idx+1}"
-            leg["slTriggerPrice"] = round(leg_ltp + 10.0, 2) if leg.get("position", "Sell").upper() in ["SELL", "S"] else round(max(0.05, leg_ltp - 10.0), 2)
-            leg["slLimitPrice"] = leg["slTriggerPrice"]
-            leg["slStatus"] = "PENDING"
-            leg["slMovedToCost"] = False
+
+            sl_enable = leg.get("slEnable", True)
+            sl_val = float(leg.get("slValue", 0) or 0)
+            sl_type = str(leg.get("slType", "Points (Pts)"))
+
+            if sl_enable and sl_val > 0:
+                sim_trig, sim_lim, _ = calculate_sl_prices(
+                    entry_price=leg_ltp,
+                    leg_action=leg.get("position", "Sell"),
+                    sl_val=sl_val,
+                    sl_type=sl_type,
+                    trigger_limit_diff=trigger_limit_diff
+                )
+                leg["slOrderNo"] = f"SIM-SL-{idx+1}"
+                leg["slTriggerPrice"] = sim_trig
+                leg["slLimitPrice"] = sim_lim
+                leg["slStatus"] = "PENDING"
+                leg["slMovedToCost"] = False
+
             register_option_for_live_ws(symbol_name)
             log_system_event(f"[SIMULATED ENTRY] Leg #{idx+1}: Contract locked @ ₹{leg_ltp:.2f} (Limit: ₹{leg_limit:.2f})", "SUCCESS")
 
