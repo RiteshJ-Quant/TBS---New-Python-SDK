@@ -1464,6 +1464,47 @@ def create_tbs_strategy():
     else:
         strike_desc = first_leg.get('strikeCriteria', 'ATM')
 
+    strat_id = data.get("id")
+    target_strat = next((s for s in STRATEGIES_STORE if s["id"] == strat_id), None) if strat_id else None
+
+    if target_strat:
+        # UPDATE EXISTING STRATEGY IN-PLACE
+        target_strat["name"] = name
+        target_strat["symbol"] = data.get("index", "NIFTY").replace(" 50", "").strip()
+        target_strat["lotsPairs"] = int(first_leg.get("lots", 1))
+        target_strat["entryTime"] = data.get("entryTime", "09:20")
+        target_strat["exitTime"] = data.get("exitTime", "15:15")
+        target_strat["sl"] = sl_desc
+        target_strat["strikeSelection"] = strike_desc
+        target_strat["scripIndex"] = data.get("scripIndex", "NIFTY 50 (NSE_FO)")
+        target_strat["strategyExpiry"] = (lambda: data.get("strategyExpiry") or (get_index_expiries(data.get("index", "NIFTY"))[0]["date"] if get_index_expiries(data.get("index", "NIFTY")) else "06-OCT-2026"))()
+        target_strat["entryType"] = data.get("entryType", "Time Based")
+        target_strat["exitType"] = data.get("exitType", "Time Based")
+        target_strat["productCode"] = data.get("productCode", "NRML (Normal Carrying)")
+        target_strat["underlyingSource"] = data.get("underlyingSource", "Cash (Spot Index LTP)")
+        target_strat["squareOffType"] = data.get("squareOffType", "Partial (Square off hit leg only)")
+        target_strat["trailSLToBreakEven"] = data.get("trailSLToBreakEven", "None")
+        target_strat["move_sl_to_cost"] = (data.get("trailSLToBreakEven") not in ["None", "", None] or bool(data.get("move_sl_to_cost", False)))
+        target_strat["refPrice"] = data.get("refPrice", "Traded Price")
+        target_strat["delayEntry"] = int(data.get("delayEntry", 0) or 0)
+        target_strat["overallTargetProfit"] = float(data.get("overallTargetProfit", 0) or 0)
+        target_strat["overallStopLoss"] = float(data.get("overallStopLoss", 0) or 0)
+        target_strat["overallReEntrySL"] = data.get("overallReEntrySL", "None")
+        target_strat["enableOverallTrailingSL"] = bool(data.get("enableOverallTrailingSL", False))
+        target_strat["legs"] = legs
+        target_strat["updatedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        if target_strat["entryType"] == "Manual Entry":
+            target_strat["entryTime"] = "Manual (Desk)"
+        if target_strat["exitType"] == "Manual Exit":
+            target_strat["exitTime"] = "Manual (Desk)"
+
+        dte_val = calculate_dte(target_strat.get("strategyExpiry", ""))
+        dte_suffix = f" ({dte_val} DTE)" if target_strat.get("strategyExpiry") else ""
+        log_system_event(f"[STRATEGY UPDATED] '{target_strat['name']}' | Symbol: {target_strat['symbol']} | Product: {get_strategy_product_code(target_strat)} | Expiry: {target_strat['strategyExpiry']}{dte_suffix} | Entry: {target_strat['entryTime']} | Exit: {target_strat['exitTime']} | SL: {target_strat['sl']} | Strike: {target_strat['strikeSelection']}", "SUCCESS")
+
+        return jsonify({"success": True, "message": "Strategy updated successfully!", "strategy": target_strat})
+
     new_strat = {
         "id": f"strat-{uuid.uuid4().hex[:8]}",
         "name": name,
@@ -1519,6 +1560,21 @@ def create_tbs_strategy():
     log_system_event(f"[STRATEGY CREATED] '{new_strat['name']}' | Symbol: {new_strat['symbol']} | Product: {get_strategy_product_code(new_strat)} | Expiry: {new_strat['strategyExpiry']}{dte_suffix} | Entry: {new_strat['entryTime']} | Exit: {new_strat['exitTime']} | SL: {new_strat['sl']} | Strike: {new_strat['strikeSelection']}", "SUCCESS")
 
     return jsonify({"success": True, "message": "Strategy saved successfully!", "strategy": new_strat})
+
+
+@app.route("/api/tbs/update", methods=["POST", "PUT"])
+def update_tbs_strategy():
+    """Updates an existing strategy."""
+    return create_tbs_strategy()
+
+
+@app.route("/api/tbs/strategy/<strat_id>", methods=["GET"])
+def get_tbs_strategy_by_id(strat_id):
+    """Returns a single strategy by ID."""
+    strat = next((s for s in STRATEGIES_STORE if s["id"] == strat_id), None)
+    if not strat:
+        return jsonify({"success": False, "message": "Strategy not found."}), 404
+    return jsonify({"success": True, "strategy": strat})
 
 
 @app.route("/api/tbs/manual-entry", methods=["POST"])

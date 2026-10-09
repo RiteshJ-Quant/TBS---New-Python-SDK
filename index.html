@@ -1070,7 +1070,7 @@
                 <div id="timeBasedView">
                     <h1 class="workspace-title">Time Based</h1>
 
-                    <button class="btn-add-strategy" onclick="showConfiguratorView()">
+                    <button class="btn-add-strategy" onclick="openNewStrategyConfigurator()">
                         <i class="fa-solid fa-plus"></i> ADD NEW STRATEGY
                     </button>
 
@@ -1203,7 +1203,7 @@
                         <button class="btn-back" onclick="showTimeBasedView()">
                             <i class="fa-solid fa-arrow-left"></i> Back to Templates
                         </button>
-                        <h1 class="config-title">Configure Strategy Template</h1>
+                        <h1 class="config-title" id="configuratorTitle">Configure Strategy Template</h1>
                     </div>
 
                     <form id="templateForm" onsubmit="handleSaveTemplate(event)">
@@ -1331,7 +1331,7 @@
                             </div>
                         </div>
 
-                        <button type="submit" class="btn-save-template">SAVE STRATEGY TEMPLATE</button>
+                        <button type="submit" id="btnSaveTemplate" class="btn-save-template">SAVE STRATEGY TEMPLATE</button>
                     </form>
                 </div>
 
@@ -1606,6 +1606,7 @@
         let pollInterval = null;
         let activeStrategyId = null;
         let legsData = [];
+        let editingStrategyId = null;
 
         // Digital Clock Trigger
         function updateClock() {
@@ -1625,6 +1626,7 @@
 
         // Navigation Switcher
         function showTimeBasedView() {
+            editingStrategyId = null;
             document.getElementById('timeBasedView').style.display = 'block';
             document.getElementById('configuratorView').style.display = 'none';
             document.getElementById('brokersView').style.display = 'none';
@@ -1639,6 +1641,39 @@
             loadTBSStrategies();
         }
 
+        function openNewStrategyConfigurator() {
+            editingStrategyId = null;
+            const titleEl = document.getElementById('configuratorTitle');
+            if (titleEl) titleEl.innerText = 'Configure Strategy Template';
+            const saveBtn = document.getElementById('btnSaveTemplate');
+            if (saveBtn) saveBtn.innerText = 'SAVE STRATEGY TEMPLATE';
+
+            const form = document.getElementById('templateForm');
+            if (form) form.reset();
+            if (document.getElementById('cfgStratName')) document.getElementById('cfgStratName').value = '920 TBS';
+            if (document.getElementById('cfgScripIndex')) document.getElementById('cfgScripIndex').value = 'NIFTY';
+            if (document.getElementById('cfgEntryTime')) document.getElementById('cfgEntryTime').value = '09:20';
+            if (document.getElementById('cfgExitTime')) document.getElementById('cfgExitTime').value = '15:15';
+            if (document.getElementById('cfgProductCode')) document.getElementById('cfgProductCode').value = 'NRML (Normal Carrying)';
+            if (document.getElementById('cfgUnderlyingSource')) document.getElementById('cfgUnderlyingSource').value = 'Cash (Spot Index LTP)';
+            if (document.getElementById('cfgSquareOffType')) document.getElementById('cfgSquareOffType').value = 'Partial (Square off hit leg only)';
+            if (document.getElementById('cfgTrailSL')) document.getElementById('cfgTrailSL').value = 'None';
+            if (document.getElementById('cfgRefPrice')) document.getElementById('cfgRefPrice').value = 'Traded Price';
+            if (document.getElementById('cfgDelayEntry')) document.getElementById('cfgDelayEntry').value = '0';
+            if (document.getElementById('cfgOverallTarget')) document.getElementById('cfgOverallTarget').value = '0';
+            if (document.getElementById('cfgOverallSL')) document.getElementById('cfgOverallSL').value = '0';
+            if (document.getElementById('cfgOverallReEntry')) document.getElementById('cfgOverallReEntry').value = 'None';
+            if (document.getElementById('cfgEnableOverallTrail')) document.getElementById('cfgEnableOverallTrail').checked = false;
+
+            const legsContainer = document.getElementById('legsContainer');
+            if (legsContainer) legsContainer.innerHTML = '';
+            legsData = [];
+            addLegCard();
+
+            fetchExpiriesForConfigurator();
+            showConfiguratorView();
+        }
+
         function showConfiguratorView() {
             document.getElementById('timeBasedView').style.display = 'none';
             document.getElementById('configuratorView').style.display = 'block';
@@ -1649,7 +1684,6 @@
             if (legsData.length === 0) {
                 addLegCard();
             }
-            fetchExpiriesForConfigurator();
         }
 
         function showBrokersView() {
@@ -2102,7 +2136,7 @@
             }
         }
 
-        async function fetchExpiriesForConfigurator() {
+        async function fetchExpiriesForConfigurator(targetExpiry = null) {
             const idxSelect = document.getElementById('cfgScripIndex');
             const expSelect = document.getElementById('cfgStrategyExpiry');
             if (!idxSelect || !expSelect) return;
@@ -2114,11 +2148,20 @@
                 const res = await fetch(`/api/tbs/expiries?index=${selectedIdx}`);
                 const data = await res.json();
                 if (data.status === 'success' && data.expiries) {
+                    let hasTarget = false;
                     expSelect.innerHTML = data.expiries.map(item => {
                         const dte = (item.dte !== undefined) ? item.dte : calculateDte(item.date);
                         const label = (item.label && item.label.includes('DTE')) ? item.label : `${item.date} (${dte} DTE)`;
+                        if (targetExpiry && item.date === targetExpiry) hasTarget = true;
                         return `<option value="${escapeHtml(item.date)}" data-dte="${dte}">${escapeHtml(label)}</option>`;
                     }).join('');
+                    if (targetExpiry) {
+                        if (!hasTarget) {
+                            const dte = calculateDte(targetExpiry);
+                            expSelect.insertAdjacentHTML('afterbegin', `<option value="${escapeHtml(targetExpiry)}" data-dte="${dte}">${escapeHtml(targetExpiry)} (${dte} DTE)</option>`);
+                        }
+                        expSelect.value = targetExpiry;
+                    }
                     updateExpiryDteBadge();
                 }
             } catch (err) {
@@ -2637,14 +2680,20 @@
                 legs: legsList
             };
 
+            if (editingStrategyId) {
+                templateData.id = editingStrategyId;
+            }
+
             try {
-                const res = await fetch('/api/tbs/create', {
+                const endpoint = editingStrategyId ? '/api/tbs/update' : '/api/tbs/create';
+                const res = await fetch(endpoint, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(templateData)
                 });
                 const data = await res.json();
                 if (data.success) {
+                    editingStrategyId = null;
                     showTimeBasedView();
                     loadTBSStrategies();
                 } else {
@@ -2653,6 +2702,117 @@
             } catch (err) {
                 console.error("Save Template Error:", err);
             }
+        }
+
+        async function editStrategy(stratId) {
+            let strat = (window.allStrategiesList || []).find(s => s.id === stratId);
+            if (!strat) {
+                try {
+                    const res = await fetch(`/api/tbs/strategy/${stratId}`);
+                    const data = await res.json();
+                    if (data.success && data.strategy) {
+                        strat = data.strategy;
+                    }
+                } catch (e) {}
+            }
+
+            if (!strat) {
+                alert("Strategy details could not be found.");
+                return;
+            }
+
+            editingStrategyId = stratId;
+
+            const titleEl = document.getElementById('configuratorTitle');
+            if (titleEl) titleEl.innerText = `Edit Strategy: ${strat.name || 'Strategy'}`;
+            const saveBtn = document.getElementById('btnSaveTemplate');
+            if (saveBtn) saveBtn.innerText = 'UPDATE STRATEGY';
+
+            if (document.getElementById('cfgStratName')) document.getElementById('cfgStratName').value = strat.name || '';
+            if (document.getElementById('cfgScripIndex')) {
+                const sym = (strat.symbol || 'NIFTY').toUpperCase().replace(' 50', '').trim();
+                document.getElementById('cfgScripIndex').value = sym;
+            }
+            if (document.getElementById('cfgEntryTime')) document.getElementById('cfgEntryTime').value = strat.entryTime || '09:20';
+            if (document.getElementById('cfgExitTime')) document.getElementById('cfgExitTime').value = strat.exitTime || '15:15';
+            if (document.getElementById('cfgProductCode')) document.getElementById('cfgProductCode').value = strat.productCode || 'NRML (Normal Carrying)';
+            if (document.getElementById('cfgUnderlyingSource')) document.getElementById('cfgUnderlyingSource').value = strat.underlyingSource || 'Cash (Spot Index LTP)';
+            if (document.getElementById('cfgSquareOffType')) document.getElementById('cfgSquareOffType').value = strat.squareOffType || 'Partial (Square off hit leg only)';
+            if (document.getElementById('cfgTrailSL')) document.getElementById('cfgTrailSL').value = strat.trailSLToBreakEven || 'None';
+            if (document.getElementById('cfgRefPrice')) document.getElementById('cfgRefPrice').value = strat.refPrice || 'Traded Price';
+            if (document.getElementById('cfgDelayEntry')) document.getElementById('cfgDelayEntry').value = strat.delayEntry !== undefined ? strat.delayEntry : 0;
+            if (document.getElementById('cfgOverallTarget')) document.getElementById('cfgOverallTarget').value = strat.overallTargetProfit !== undefined ? strat.overallTargetProfit : 0;
+            if (document.getElementById('cfgOverallSL')) document.getElementById('cfgOverallSL').value = strat.overallStopLoss !== undefined ? strat.overallStopLoss : 0;
+            if (document.getElementById('cfgOverallReEntry')) document.getElementById('cfgOverallReEntry').value = strat.overallReEntrySL || 'None';
+            if (document.getElementById('cfgEnableOverallTrail')) document.getElementById('cfgEnableOverallTrail').checked = Boolean(strat.enableOverallTrailingSL);
+
+            // Fetch Expiries for this index and select the strategy's expiry
+            await fetchExpiriesForConfigurator(strat.strategyExpiry);
+
+            // Clear and populate Legs
+            const legsContainer = document.getElementById('legsContainer');
+            if (legsContainer) legsContainer.innerHTML = '';
+            legsData = [];
+
+            const legsToRender = (strat.legs && strat.legs.length > 0) ? strat.legs : [{
+                lots: strat.lotsPairs || 1,
+                position: 'Sell',
+                optionType: 'Call',
+                strikeCriteria: 'Closest Premium',
+                strikeValue: 20,
+                slEnable: true,
+                slType: 'Points (Pts)',
+                slValue: 10,
+                targetEnable: false,
+                targetType: 'Points (Pts)',
+                targetValue: 0
+            }];
+
+            legsToRender.forEach((leg) => {
+                addLegCard();
+                const legId = legsData[legsData.length - 1].id;
+
+                const lotsEl = document.getElementById(`legLots_${legId}`);
+                if (lotsEl) lotsEl.value = leg.lots || 1;
+
+                const posEl = document.getElementById(`legPosition_${legId}`);
+                if (posEl) posEl.value = leg.position || 'Sell';
+
+                const optEl = document.getElementById(`legOptionType_${legId}`);
+                if (optEl) optEl.value = leg.optionType || 'Call';
+
+                updateLegStrikeOptions(legId);
+
+                const critEl = document.getElementById(`legStrikeCriteria_${legId}`);
+                if (critEl) critEl.value = leg.strikeCriteria || 'Closest Premium';
+
+                toggleStrikeValInput(legId);
+
+                const valEl = document.getElementById(`legStrikeVal_${legId}`);
+                if (valEl) valEl.value = (leg.strikeValue !== undefined) ? leg.strikeValue : 20;
+
+                const slCheck = document.getElementById(`legSLEnable_${legId}`);
+                if (slCheck) slCheck.checked = leg.slEnable !== undefined ? Boolean(leg.slEnable) : true;
+
+                const slType = document.getElementById(`legSLType_${legId}`);
+                if (slType) slType.value = leg.slType || 'Points (Pts)';
+
+                const slVal = document.getElementById(`legSLVal_${legId}`);
+                if (slVal) slVal.value = (leg.slValue !== undefined) ? leg.slValue : 10;
+
+                const tgtCheck = document.getElementById(`legTgtEnable_${legId}`);
+                if (tgtCheck) tgtCheck.checked = Boolean(leg.targetEnable);
+
+                const tgtType = document.getElementById(`legTgtType_${legId}`);
+                if (tgtType) tgtType.value = leg.targetType || 'Points (Pts)';
+
+                const tgtVal = document.getElementById(`legTgtVal_${legId}`);
+                if (tgtVal) tgtVal.value = (leg.targetValue !== undefined) ? leg.targetValue : 0;
+
+                updateLegQtyBadge(legId);
+            });
+
+            showConfiguratorView();
         }
 
         function showTBSDashboardView() {
@@ -2665,6 +2825,7 @@
                 const res = await fetch('/api/tbs/strategies');
                 const data = await res.json();
                 if (data.status === 'success') {
+                    window.allStrategiesList = data.allStrategies || [];
                     renderAllStrategies(data.allStrategies);
                     renderActiveStrategies(data.activeStrategies, data.recentExitedStrategies);
                 }
@@ -2746,7 +2907,7 @@
                         <div class="action-icons">
                             ${actionBtn}
                             ${prewarmBtn}
-                            <button class="action-icon-btn edit-btn" title="Edit Strategy" onclick="showConfiguratorView()"><i class="fa-regular fa-pen-to-square"></i></button>
+                            <button class="action-icon-btn edit-btn" title="Edit Strategy" onclick="editStrategy('${s.id}')"><i class="fa-regular fa-pen-to-square"></i></button>
                             <button class="action-icon-btn delete-btn" title="Delete Strategy" onclick="deleteStrategy('${s.id}')"><i class="fa-regular fa-trash-can"></i></button>
                         </div>
                     </td>
