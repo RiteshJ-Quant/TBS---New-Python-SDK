@@ -43,6 +43,7 @@ import uuid
 import datetime
 import calendar
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List
 from flask import Flask, request, jsonify, send_from_directory, Response
 import pandas as pd
@@ -295,9 +296,9 @@ def get_index_expiries(index_symbol: str) -> List[Dict[str, Any]]:
     today = datetime.date.today()
     dates_set = set(INDEX_EXPIRIES_MAP.get(symbol_upper, set()))
 
-    # 1. Query Kotak Neo API Option Chain if active session is present
+    # 1. Query Kotak Neo API Option Chain only if master CSV did not provide dates
     client = SESSION_DATA.get("client")
-    if client is not None:
+    if not dates_set and client is not None:
         try:
             exchange_seg = "bse_fo" if symbol_upper in ["SENSEX", "BANKEX"] else "nse_fo"
             res = client.option_chain(exchange=exchange_seg, underlying=symbol_upper, count=1)
@@ -857,23 +858,34 @@ def get_option_chain_candidates(sym_base: str, opt_type: str, strategy_expiry: s
 
     client = SESSION_DATA.get("client")
     chain_quotes = {}
-    cache_key = f"{symbol_upper}_{exp_code}_{opt_type_code}"
+    base_cache_key = f"{symbol_upper}_{iso_expiry}"
     now_ts = time.time()
 
-    # 5-Second Cache to avoid 429 Too Many Requests
-    cached = OPTION_CHAIN_CACHE.get(cache_key)
-    if cached and (now_ts - cached.get("timestamp", 0)) < 5.0:
-        chain_quotes = cached.get("quotes", {})
+    # Unified 30-Second Cache for both CE and PE + 10-Second Cooldown on broker 429/errors
+    cached_entry = OPTION_CHAIN_CACHE.get(base_cache_key)
+    use_cache = False
+    if cached_entry:
+        age = now_ts - cached_entry.get("timestamp", 0)
+        if cached_entry.get("cooldown", False):
+            if age < 10.0:
+                use_cache = True
+        elif age < 30.0:
+            use_cache = True
+
+    if use_cache and cached_entry:
+        chain_quotes = cached_entry.get(opt_type_code, {})
     elif client:
         try:
             exch = "bse_fo" if symbol_upper in ["SENSEX", "BANKEX"] else "nse_fo"
             res = client.option_chain(exchange=exch, underlying=symbol_upper, expiry=iso_expiry, count=40)
             if isinstance(res, dict) and "data" in res:
                 c_data = res["data"]
-                items = c_data.get("call", []) if opt_type_code == "CE" else c_data.get("put", [])
-                for item in items:
-                    inst = item.get("inst") or item.get("instrument") or {}
-                    quote = item.get("quote") or {}
+                ce_quotes = {}
+                pe_quotes = {}
+
+                for call_item in c_data.get("call", []):
+                    inst = call_item.get("inst") or call_item.get("instrument") or {}
+                    quote = call_item.get("quote") or {}
                     stk_raw = float(inst.get("strkPrc") or inst.get("strikePrice") or inst.get("pStrikePrice") or inst.get("dStrikePrice") or 0)
                     if stk_raw > 100000:
                         stk_raw = stk_raw / 100.0
@@ -881,20 +893,68 @@ def get_option_chain_candidates(sym_base: str, opt_type: str, strategy_expiry: s
                     tok = str(inst.get("pSymbol") or inst.get("pTok") or inst.get("tok") or inst.get("instrument_token") or "").strip()
                     trd_sym = str(inst.get("pSymbolName") or inst.get("pTrdSymbol") or "").strip()
                     if not trd_sym:
-                        matched = MASTER_CONTRACTS_MAP.get((symbol_upper, exp_code, int(stk_raw), opt_type_code))
-                        trd_sym = matched[0] if matched else f"{symbol_upper}{exp_code}{int(stk_raw)}{opt_type_code}"
+                        matched = MASTER_CONTRACTS_MAP.get((symbol_upper, exp_code, int(stk_raw), "CE"))
+                        trd_sym = matched[0] if matched else f"{symbol_upper}{exp_code}{int(stk_raw)}CE"
 
                     if stk_raw > 0 and ltp > 0:
-                        chain_quotes[int(stk_raw)] = ltp
+                        ce_quotes[int(stk_raw)] = ltp
                         OPTION_LIVE_PRICES[trd_sym] = ltp
                         OPTION_LIVE_PRICES[str(int(stk_raw))] = ltp
                         if tok:
                             TOKEN_TO_SYMBOL_MAP[tok] = trd_sym
                             register_option_for_live_ws(trd_sym, tok, exch)
 
-                OPTION_CHAIN_CACHE[cache_key] = {"quotes": chain_quotes, "timestamp": now_ts}
+                for put_item in c_data.get("put", []):
+                    inst = put_item.get("inst") or put_item.get("instrument") or {}
+                    quote = put_item.get("quote") or {}
+                    stk_raw = float(inst.get("strkPrc") or inst.get("strikePrice") or inst.get("pStrikePrice") or inst.get("dStrikePrice") or 0)
+                    if stk_raw > 100000:
+                        stk_raw = stk_raw / 100.0
+                    ltp = float(quote.get("ltp") or quote.get("lastPrice") or 0)
+                    tok = str(inst.get("pSymbol") or inst.get("pTok") or inst.get("tok") or inst.get("instrument_token") or "").strip()
+                    trd_sym = str(inst.get("pSymbolName") or inst.get("pTrdSymbol") or "").strip()
+                    if not trd_sym:
+                        matched = MASTER_CONTRACTS_MAP.get((symbol_upper, exp_code, int(stk_raw), "PE"))
+                        trd_sym = matched[0] if matched else f"{symbol_upper}{exp_code}{int(stk_raw)}PE"
+
+                    if stk_raw > 0 and ltp > 0:
+                        pe_quotes[int(stk_raw)] = ltp
+                        OPTION_LIVE_PRICES[trd_sym] = ltp
+                        OPTION_LIVE_PRICES[str(int(stk_raw))] = ltp
+                        if tok:
+                            TOKEN_TO_SYMBOL_MAP[tok] = trd_sym
+                            register_option_for_live_ws(trd_sym, tok, exch)
+
+                OPTION_CHAIN_CACHE[base_cache_key] = {
+                    "CE": ce_quotes,
+                    "PE": pe_quotes,
+                    "timestamp": now_ts,
+                    "cooldown": False
+                }
+                chain_quotes = ce_quotes if opt_type_code == "CE" else pe_quotes
+            else:
+                # Broker returned 429 or error response without 'data' -> apply 10s backoff cooldown to prevent rapid retry storms
+                existing_ce = cached_entry.get("CE", {}) if cached_entry else {}
+                existing_pe = cached_entry.get("PE", {}) if cached_entry else {}
+                OPTION_CHAIN_CACHE[base_cache_key] = {
+                    "CE": existing_ce,
+                    "PE": existing_pe,
+                    "timestamp": now_ts,
+                    "cooldown": True
+                }
+                chain_quotes = existing_ce if opt_type_code == "CE" else existing_pe
         except Exception:
-            pass
+            existing_ce = cached_entry.get("CE", {}) if cached_entry else {}
+            existing_pe = cached_entry.get("PE", {}) if cached_entry else {}
+            OPTION_CHAIN_CACHE[base_cache_key] = {
+                "CE": existing_ce,
+                "PE": existing_pe,
+                "timestamp": now_ts,
+                "cooldown": True
+            }
+            chain_quotes = existing_ce if opt_type_code == "CE" else existing_pe
+    elif cached_entry:
+        chain_quotes = cached_entry.get(opt_type_code, {})
 
     candidates = []
 
@@ -1647,7 +1707,9 @@ def manual_entry_tbs_strategy():
             legs = target_strat.get("legs", [])
             if not legs:
                 legs = [{}]
-            for leg in legs:
+            trigger_limit_diff = float(PROFILE_SETTINGS.get("triggerLimitDiff", 1.0))
+
+            def execute_single_manual_leg(idx, leg):
                 strike, option_ltp, limit_price, trd_sym = resolve_leg_strike_and_price(sym_base, leg, strategy_expiry=target_strat.get("strategyExpiry"))
                 opt_type_code = "CE" if leg.get("optionType", "Call").title() in ["Call", "CE"] else "PE"
                 symbol_name = trd_sym or f"{sym_base}26SEP{strike}{opt_type_code}"
@@ -1664,9 +1726,10 @@ def manual_entry_tbs_strategy():
                     price=str(limit_price),
                     validity="DAY"
                 )
+                confirmed_no = None
                 if isinstance(res, dict) and (res.get("nOrdNo") or res.get("stat") == "Ok"):
-                    order_ref = res.get("nOrdNo", order_ref)
-                    print(f"[+] Manual Desk Limit Order Executed with Kotak Neo! Order No: {order_ref}")
+                    confirmed_no = res.get("nOrdNo", order_ref)
+                    print(f"[+] Manual Desk Limit Order Executed with Kotak Neo! Order No: {confirmed_no}")
                     leg["executedSymbol"] = symbol_name
                     leg["executedStrike"] = strike
                     leg["executedEntryPrice"] = option_ltp
@@ -1677,7 +1740,6 @@ def manual_entry_tbs_strategy():
                     sl_val = float(leg.get("slValue", 0) or 0)
                     sl_type = str(leg.get("slType", "Points (Pts)"))
                     if sl_enable and sl_val > 0:
-                        trigger_limit_diff = float(PROFILE_SETTINGS.get("triggerLimitDiff", 1.0))
                         sl_trigger, sl_limit, sl_tx_type = calculate_sl_prices(
                             entry_price=option_ltp,
                             leg_action=leg_action,
@@ -1702,7 +1764,16 @@ def manual_entry_tbs_strategy():
                             leg["slTriggerPrice"] = sl_trigger
                             leg["slLimitPrice"] = sl_limit
                             leg["slStatus"] = "PENDING"
-                            log_system_event(f"[MANUAL DESK SL CONFIRMED] Leg: Kotak Neo SL Order No: {sl_no} | Trigger: ₹{sl_trigger:.2f} | Limit: ₹{sl_limit:.2f}", "SUCCESS")
+                            log_system_event(f"[MANUAL DESK SL CONFIRMED] Leg #{idx+1}: Kotak Neo SL Order No: {sl_no} | Trigger: ₹{sl_trigger:.2f} | Limit: ₹{sl_limit:.2f}", "SUCCESS")
+                return confirmed_no
+
+            num_workers = min(4, max(1, len(legs)))
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(execute_single_manual_leg, idx, leg) for idx, leg in enumerate(legs)]
+                for fut in futures:
+                    c_no = fut.result()
+                    if c_no:
+                        order_ref = c_no
         except Exception as e:
             print(f"[-] Manual Desk Order Placement Notice: {e}")
 
@@ -1873,9 +1944,10 @@ def execute_strategy_entry(target_strat: dict) -> dict:
 
     if client is not None:
         try:
-            for idx, leg in enumerate(legs):
-                leg_strike, leg_ltp, leg_limit, leg_symbol = resolve_leg_strike_and_price(sym_base, leg, target_strat["id"], idx, strategy_expiry=target_strat.get("strategyExpiry"))
-                executed_ltps.append(leg_ltp)
+            def execute_single_entry_leg(idx, leg):
+                leg_strike, leg_ltp, leg_limit, leg_symbol = resolve_leg_strike_and_price(
+                    sym_base, leg, target_strat["id"], idx, strategy_expiry=target_strat.get("strategyExpiry")
+                )
                 leg["executedEntryPrice"] = leg_ltp
 
                 opt_type_code = "CE" if leg.get("optionType", "Call").title() in ["Call", "CE"] else "PE"
@@ -1910,10 +1982,10 @@ def execute_strategy_entry(target_strat: dict) -> dict:
                     elif res.get("stat") == "Not_Ok" or res.get("stCode") == 100008 or "unauthorized" in str(res.get("errMsg", "")).lower():
                         err_msg = res.get("errMsg", "Unauthorized")
                         log_system_event(f"KOTAK API REJECTED: 401 Unauthorized (stCode: {res.get('stCode')}, Message: '{err_msg}'). Session token expired! Please re-login via Broker Settings.", "ERROR")
-                
+                    else:
+                        log_system_event(f"KOTAK API ENTRY NOTICE Leg #{idx+1} ({symbol_name}): {res}", "WARN")
+
                 if confirmed_order_no:
-                    order_ref = confirmed_order_no
-                    entry_order_confirmations.append(confirmed_order_no)
                     log_system_event(f"[ENTRY ORDER FILLED] Leg #{idx+1} {symbol_name}: Kotak Neo Order No: {confirmed_order_no} | Fill Price: ₹{leg_ltp:.2f}", "SUCCESS")
 
                     # IMMEDIATELY submit matching Stoploss order if Stoploss is enabled for this leg
@@ -1953,16 +2025,35 @@ def execute_strategy_entry(target_strat: dict) -> dict:
                         
                         if sl_order_no:
                             log_system_event(f"[STOPLOSS ORDER CONFIRMED] Leg #{idx+1}: Kotak Neo SL Order No: {sl_order_no}", "SUCCESS")
-                            sl_orders_placed.append(sl_order_no)
                             leg["slOrderNo"] = str(sl_order_no)
                             leg["slTriggerPrice"] = sl_trigger
                             leg["slLimitPrice"] = sl_limit
                             leg["slStatus"] = "PENDING"
                             leg["slMovedToCost"] = False
+                            return (leg_ltp, confirmed_order_no, sl_order_no)
                         else:
                             log_system_event(f"[STOPLOSS ORDER RESPONSE] {sl_res}", "INFO")
+                            return (leg_ltp, confirmed_order_no, None)
                     else:
                         log_system_event(f"[STOPLOSS] Leg #{idx+1} ({symbol_name}): Stoploss is DISABLED (SL: None). Position running without SL order.", "INFO")
+                        return (leg_ltp, confirmed_order_no, None)
+                else:
+                    return (leg_ltp, None, None)
+
+            num_workers = min(4, max(1, len(legs)))
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(execute_single_entry_leg, idx, leg) for idx, leg in enumerate(legs)]
+                for fut in futures:
+                    try:
+                        ltp_val, entry_ord, sl_ord = fut.result()
+                        executed_ltps.append(ltp_val)
+                        if entry_ord:
+                            entry_order_confirmations.append(entry_ord)
+                            order_ref = entry_ord
+                        if sl_ord:
+                            sl_orders_placed.append(sl_ord)
+                    except Exception as fe:
+                        log_system_event(f"Leg execution thread error: {fe}", "ERROR")
         except Exception as e:
             log_system_event(f"Live Broker Order Execution Exception: {e}", "ERROR")
     else:
