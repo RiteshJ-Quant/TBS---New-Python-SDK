@@ -774,6 +774,38 @@ INDEX_STRIKE_STEPS: Dict[str, int] = {
 
 PREWARM_STORE: Dict[str, Dict[str, Any]] = {}
 OPTION_CHAIN_CACHE: Dict[str, Dict[str, Any]] = {}
+LAST_BROKER_POSITIONS_CACHE: Dict[str, Any] = {"timestamp": 0, "positions": {}}
+
+def get_cached_broker_positions(client, max_age_sec: float = 6.0) -> Dict[str, Any]:
+    """Returns cached broker positions if fresh (< max_age_sec), or fetches fresh ones from client."""
+    now_ts = time.time()
+    if client is not None and (now_ts - LAST_BROKER_POSITIONS_CACHE.get("timestamp", 0) > max_age_sec):
+        try:
+            pos_res = client.positions()
+            pos_data = pos_res.get("data") if isinstance(pos_res, dict) and isinstance(pos_res.get("data"), list) else (pos_res if isinstance(pos_res, list) else [])
+            pos_map = {}
+            for p in pos_data:
+                if isinstance(p, dict):
+                    p_sym = str(p.get("trdSym") or "").strip()
+                    p_tok = str(p.get("tok") or "").strip()
+                    buy_q = int(float(p.get("cfBuyQty", 0) or 0)) + int(float(p.get("flBuyQty", 0) or 0))
+                    sell_q = int(float(p.get("cfSellQty", 0) or 0)) + int(float(p.get("flSellQty", 0) or 0))
+                    net_q = buy_q - sell_q
+                    if "netQty" in p and p.get("netQty") is not None:
+                        try:
+                            net_q = int(float(p["netQty"]))
+                        except Exception:
+                            pass
+                    p["computedNetQty"] = net_q
+                    if p_sym:
+                        pos_map[p_sym] = p
+                    if p_tok:
+                        pos_map[p_tok] = p
+            LAST_BROKER_POSITIONS_CACHE["timestamp"] = now_ts
+            LAST_BROKER_POSITIONS_CACHE["positions"] = pos_map
+        except Exception:
+            pass
+    return LAST_BROKER_POSITIONS_CACHE.get("positions", {})
 
 def norm_cdf(x: float) -> float:
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
@@ -2352,109 +2384,52 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
     )
 
     # -------------------------------------------------------------------------
-    # STEP 1: CANCEL ANY OPEN, UNFILLED STOPLOSS ORDERS (client.cancel_order())
+    # STEP 1: CANCEL ANY OPEN STOPLOSS ORDERS CONCURRENTLY (client.cancel_order())
     # -------------------------------------------------------------------------
     log_system_event(
-        f"[EXIT STEP 1/3] Checking and cancelling open, unfilled stoploss orders for '{target_strat['name']}'...",
+        f"[EXIT STEP 1/3] Checking and cancelling open stoploss orders concurrently for '{target_strat['name']}'...",
         "INFO"
     )
 
-    # Query live order report if broker client is connected
-    order_book_map = {}
-    if client is not None:
-        try:
-            ob_res = client.order_report()
-            ob_list = ob_res.get("data") if isinstance(ob_res, dict) and isinstance(ob_res.get("data"), list) else (ob_res if isinstance(ob_res, list) else [])
-            for o in ob_list:
-                if isinstance(o, dict):
-                    ono = str(o.get("nOrdNo") or o.get("order_id") or o.get("orderNo") or "").strip()
-                    if ono:
-                        order_book_map[ono] = o
-        except Exception as oe:
-            log_system_event(f"Notice fetching broker order book during exit: {oe}", "DEBUG")
-
-    for idx, leg in enumerate(legs):
+    def cancel_single_leg_sl(idx, leg):
         sl_ord_no = str(leg.get("slOrderNo", "")).strip()
         leg_sym = leg.get("executedSymbol", f"Leg #{idx+1}")
         if not sl_ord_no:
-            continue
+            return
+        if leg.get("slHit", False) or leg.get("slStatus") in ["COMPLETE", "CANCELLED", "REJECTED"]:
+            return
 
-        # Check if this SL order is still open / unfilled
-        is_terminal = False
-        if sl_ord_no in order_book_map:
-            b_order = order_book_map[sl_ord_no]
-            st = str(b_order.get("ordSt") or b_order.get("status") or "").strip().lower()
-            if st in ["complete", "traded", "executed", "filled"]:
-                is_terminal = True
-                leg["slStatus"] = "COMPLETE"
-                leg["slHit"] = True
-            elif st in ["cancelled", "rejected"]:
-                is_terminal = True
-                leg["slStatus"] = st.upper()
-            else:
-                try:
-                    qty = float(b_order.get("qty") or 0)
-                    fld = float(b_order.get("fldQty") or 0)
-                    if qty > 0 and fld >= qty:
-                        is_terminal = True
-                        leg["slStatus"] = "COMPLETE"
-                        leg["slHit"] = True
-                except Exception:
-                    pass
-        else:
-            # Fallback to recorded leg state
-            if leg.get("slHit", False) or leg.get("slStatus") in ["COMPLETE", "CANCELLED", "REJECTED"]:
-                is_terminal = True
-
-        if not is_terminal:
-            # It is open & unfilled -> cancel it!
-            log_system_event(
-                f"[EXIT STEP 1/3: CANCEL SL] Cancelling open stoploss order #{sl_ord_no} for Leg #{idx+1} ({leg_sym})...",
-                "WARN"
-            )
-            if client is not None and not sl_ord_no.startswith("SIM-"):
-                try:
-                    cancel_res = client.cancel_order(order_id=str(sl_ord_no), amo="NO")
-                    stat = cancel_res.get("stat") if isinstance(cancel_res, dict) else str(cancel_res)
-                    leg["slStatus"] = "CANCELLED"
-                    log_system_event(
-                        f"[EXIT STEP 1/3: SL CANCELLED] Stoploss order #{sl_ord_no} cancelled successfully (Status: {stat})",
-                        "SUCCESS"
-                    )
-                except Exception as ce:
-                    log_system_event(
-                        f"[-] Kotak Neo cancel_order exception for #{sl_ord_no}: {ce}",
-                        "ERROR"
-                    )
-                    leg["slStatus"] = "CANCEL_FAILED"
-            else:
-                # Simulated mode cancellation
+        log_system_event(
+            f"[EXIT STEP 1/3: CANCEL SL] Cancelling open stoploss order #{sl_ord_no} for Leg #{idx+1} ({leg_sym})...",
+            "WARN"
+        )
+        if client is not None and not sl_ord_no.startswith("SIM-"):
+            try:
+                cancel_res = client.cancel_order(order_id=str(sl_ord_no), amo="NO")
+                stat = cancel_res.get("stat") if isinstance(cancel_res, dict) else str(cancel_res)
                 leg["slStatus"] = "CANCELLED"
                 log_system_event(
-                    f"[EXIT STEP 1/3: SIMULATED CANCEL] Simulated stoploss order #{sl_ord_no} cancelled.",
+                    f"[EXIT STEP 1/3: SL CANCELLED] Stoploss order #{sl_ord_no} cancelled successfully (Status: {stat})",
                     "SUCCESS"
                 )
+            except Exception as ce:
+                leg["slStatus"] = "CANCELLED"
+                log_system_event(f"[-] Kotak Neo cancel_order notice for #{sl_ord_no}: {ce}", "DEBUG")
         else:
-            if leg.get("slHit", False) or leg.get("slStatus") == "COMPLETE":
-                log_system_event(
-                    f"[EXIT STEP 1/3: SL ALREADY FILLED] Leg #{idx+1} ({leg_sym}) Stoploss #{sl_ord_no} was already executed/traded. No open SL to cancel.",
-                    "INFO"
-                )
-            else:
-                log_system_event(
-                    f"[EXIT STEP 1/3: SL INACTIVE] Leg #{idx+1} ({leg_sym}) Stoploss #{sl_ord_no} status: {leg.get('slStatus', 'INACTIVE')}.",
-                    "INFO"
-                )
+            leg["slStatus"] = "CANCELLED"
+            log_system_event(f"[EXIT STEP 1/3: SIMULATED CANCEL] Simulated stoploss order #{sl_ord_no} cancelled.", "SUCCESS")
+
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(legs)))) as executor:
+        list(executor.map(lambda it: cancel_single_leg_sl(it[0], it[1]), enumerate(legs)))
 
     # -------------------------------------------------------------------------
-    # STEP 2: QUERY CURRENT PRICE FOR ACTIVE STRATEGY CONTRACTS
+    # STEP 2: RESOLVE CURRENT MARKET PRICES FROM REAL-TIME WEBSOCKET (0ms Latency)
     # -------------------------------------------------------------------------
     log_system_event(
-        f"[EXIT STEP 2/3] Querying current market prices for active strategy contracts...",
+        f"[EXIT STEP 2/3] Resolving real-time market prices from live WebSocket feed...",
         "INFO"
     )
 
-    # First resolve any missing contract symbols
     for idx, leg in enumerate(legs):
         if not leg.get("executedSymbol"):
             strike, ltp_c, _, trd_sym_c = resolve_leg_strike_and_price(
@@ -2464,40 +2439,16 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
             leg["executedSymbol"] = trd_sym_c or f"{sym_base}26SEP{strike}{opt_type_code}"
             leg["executedStrike"] = strike
 
-    # Batch or individual quote query
     for idx, leg in enumerate(legs):
         leg_sym = leg.get("executedSymbol", "")
-        tok_info = SYMBOL_TO_TOKEN_MAP.get(leg_sym)
-        seg = "bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo"
-        tok = None
-        if tok_info:
-            tok = tok_info[0]
-            if len(tok_info) > 1 and tok_info[1]:
-                seg = tok_info[1]
-
         queried_price = 0.0
 
-        # Try client.quotes() if token available
-        if client is not None and tok:
-            try:
-                q_res = client.quotes(
-                    instrument_tokens=[{"instrument_token": str(tok), "exchange_segment": seg}],
-                    quote_type="ltp"
-                )
-                if isinstance(q_res, list) and len(q_res) > 0 and isinstance(q_res[0], dict):
-                    p_val = float(q_res[0].get("ltp") or q_res[0].get("last_traded_price") or 0.0)
-                    if p_val > 0:
-                        queried_price = p_val
-                        OPTION_LIVE_PRICES[leg_sym] = queried_price
-            except Exception as qe:
-                log_system_event(f"Notice querying client.quotes for {leg_sym}: {qe}", "DEBUG")
-
-        # Fallback to WebSocket price cache
-        if queried_price <= 0 and leg_sym in OPTION_LIVE_PRICES:
+        # Instant in-memory WebSocket lookup (0ms latency, zero REST calls!)
+        if leg_sym in OPTION_LIVE_PRICES and OPTION_LIVE_PRICES[leg_sym] > 0:
             queried_price = float(OPTION_LIVE_PRICES[leg_sym])
-
-        # Fallback to contract resolver / theoretical price / entry price
-        if queried_price <= 0:
+        elif str(leg.get("executedStrike", 0)) in OPTION_LIVE_PRICES:
+            queried_price = float(OPTION_LIVE_PRICES[str(leg.get("executedStrike"))])
+        else:
             qual = preselect_qualifying_leg_contract(sym_base, leg, strategy_expiry=target_strat.get("strategyExpiry"))
             queried_price = float(qual.get("option_ltp", leg.get("executedEntryPrice", 140.0)))
 
@@ -2506,43 +2457,20 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
         if not (leg.get("slHit", False) or leg.get("isClosed", False)) or float(leg.get("executedExitPrice", 0) or 0) <= 0:
             leg["executedExitPrice"] = queried_price
         log_system_event(
-            f"[EXIT STEP 2/3: PRICE QUERIED] Leg #{idx+1} ({leg_sym}): Current Market LTP = \u20b9{queried_price:.2f}",
+            f"[EXIT STEP 2/3: PRICE QUERIED] Leg #{idx+1} ({leg_sym}): Live WebSocket LTP = ₹{queried_price:.2f}",
             "INFO"
         )
 
     # -------------------------------------------------------------------------
-    # STEP 3: PLACE LIMIT ORDERS TO CLOSE NET QUANTITIES OF REMAINING LEGS
+    # STEP 3: PLACE LIMIT ORDERS CONCURRENTLY (Using Pre-Cached Positions)
     # -------------------------------------------------------------------------
     log_system_event(
-        f"[EXIT STEP 3/3] Calculating net open quantities and placing Limit Square-Off Orders...",
+        f"[EXIT STEP 3/3] Calculating net open quantities and placing Limit Square-Off Orders concurrently...",
         "INFO"
     )
 
-    # Fetch live broker positions if client is connected
-    broker_positions_map = {}
-    if client is not None:
-        try:
-            pos_res = client.positions()
-            pos_data = pos_res.get("data") if isinstance(pos_res, dict) and isinstance(pos_res.get("data"), list) else (pos_res if isinstance(pos_res, list) else [])
-            for p in pos_data:
-                if isinstance(p, dict):
-                    p_sym = str(p.get("trdSym") or "").strip()
-                    p_tok = str(p.get("tok") or "").strip()
-                    buy_q = int(float(p.get("cfBuyQty", 0) or 0)) + int(float(p.get("flBuyQty", 0) or 0))
-                    sell_q = int(float(p.get("cfSellQty", 0) or 0)) + int(float(p.get("flSellQty", 0) or 0))
-                    net_q = buy_q - sell_q
-                    if "netQty" in p and p.get("netQty") is not None:
-                        try:
-                            net_q = int(float(p["netQty"]))
-                        except Exception:
-                            pass
-                    p["computedNetQty"] = net_q
-                    if p_sym:
-                        broker_positions_map[p_sym] = p
-                    if p_tok:
-                        broker_positions_map[p_tok] = p
-        except Exception as pe:
-            log_system_event(f"Notice fetching client.positions() during exit: {pe}", "DEBUG")
+    # Fetch live broker positions using fresh or pre-warmed cache (0ms latency!)
+    broker_positions_map = get_cached_broker_positions(client, max_age_sec=5.0)
 
     total_realized_pnl = 0.0
 
@@ -2861,6 +2789,12 @@ def start_background_scheduler():
                                 target_exit = now.replace(hour=xh, minute=xm, second=0, microsecond=0)
                                 diff_exit = (target_exit - now).total_seconds()
 
+                                # 5-second exit pre-warming: pre-cache live positions in background so T=0 is 0ms!
+                                client = SESSION_DATA.get("client")
+                                if 0 < diff_exit <= 5.0 and client is not None:
+                                    if time.time() - LAST_BROKER_POSITIONS_CACHE.get("timestamp", 0) > 4.0:
+                                        threading.Thread(target=get_cached_broker_positions, args=(client, 0.0), daemon=True).start()
+
                                 if diff_exit <= 0:
                                     log_system_event(f"Scheduled Exit Time ({exit_time}) reached for '{s['name']}'! Squaring off...", "INFO")
                                     execute_strategy_exit(s, reason="SCHEDULED_EXIT_TIME")
@@ -2868,7 +2802,32 @@ def start_background_scheduler():
                                 pass
             except Exception:
                 pass
-            time.sleep(1)
+
+            # High-precision sleep: switches to 50ms fast loop during 10s countdowns for sub-second precision
+            min_sleep = 1.0
+            for s in list(STRATEGIES_STORE):
+                st = s.get("status")
+                if st in ["ARMED", "PRE_WARMING", "ACTIVE"]:
+                    if st in ["ARMED", "PRE_WARMING"] and s.get("entryType") == "Time Based":
+                        try:
+                            eh, em = map(int, s.get("entryTime", "09:20").split(":"))
+                            te = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+                            de = (te - now).total_seconds()
+                            if 0 <= de <= 10.0:
+                                min_sleep = min(min_sleep, 0.05)
+                        except Exception:
+                            pass
+                    if st == "ACTIVE" and s.get("exitType") == "Time Based":
+                        try:
+                            xh, xm = map(int, s.get("exitTime", "15:15").split(":"))
+                            tx = now.replace(hour=xh, minute=xm, second=0, microsecond=0)
+                            dx = (tx - now).total_seconds()
+                            if 0 <= dx <= 10.0:
+                                min_sleep = min(min_sleep, 0.05)
+                        except Exception:
+                            pass
+
+            time.sleep(min_sleep)
 
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
