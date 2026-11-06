@@ -87,11 +87,16 @@ INDEX_EXPIRIES_MAP: Dict[str, set] = {}               # symbol -> set of expiry 
 INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
 
 
-def load_scrip_token_map():
+def load_scrip_token_map(force: bool = False):
     """Loads Master Scrip CSV files into fast memory lookup dictionaries for WebSocket streaming & contract resolution."""
     global SYMBOL_TO_TOKEN_MAP, TOKEN_TO_SYMBOL_MAP, MASTER_CONTRACTS_MAP, INDEX_EXPIRIES_MAP
-    if SYMBOL_TO_TOKEN_MAP and MASTER_CONTRACTS_MAP:
+    if not force and SYMBOL_TO_TOKEN_MAP and MASTER_CONTRACTS_MAP:
         return
+    if force:
+        SYMBOL_TO_TOKEN_MAP.clear()
+        TOKEN_TO_SYMBOL_MAP.clear()
+        MASTER_CONTRACTS_MAP.clear()
+        INDEX_EXPIRIES_MAP.clear()
     for filename, seg in [("nse_fo.csv", "nse_fo"), ("bse_fo.csv", "bse_fo"), ("nse_cm.csv", "nse_cm"), ("bse_cm.csv", "bse_cm")]:
         path = os.path.join(MASTER_DIR, filename)
         if not os.path.exists(path):
@@ -148,6 +153,29 @@ def register_option_for_live_ws(trading_symbol: str, token: str = None, seg: str
         PENDING_WS_SUBSCRIPTIONS.add((seg, token))
         SYMBOL_TO_TOKEN_MAP[sym] = (token, seg)
         TOKEN_TO_SYMBOL_MAP[token] = sym
+
+
+def sync_master_scrips_in_background(api_client, force: bool = False):
+    """Background worker to download latest master CSVs from broker and reload tokens into memory."""
+    def _worker():
+        try:
+            from websocket import download_master_scrips, are_master_scrips_downloaded_today
+            if not force and are_master_scrips_downloaded_today():
+                today_str = datetime.date.today().strftime("%d-%b-%Y")
+                print(f"[+] Master Scrips are already up-to-date for today ({today_str}). Skipping re-download.")
+                if not MASTER_CONTRACTS_MAP:
+                    load_scrip_token_map()
+                return
+
+            print("[*] Downloading latest Master Scrip CSV files in background...")
+            downloaded = download_master_scrips(api_client, force=force)
+            if downloaded:
+                load_scrip_token_map(force=True)
+                log_system_event(f"Fresh Master Scrips synchronized ({len(MASTER_CONTRACTS_MAP)} active contracts)!", "SUCCESS")
+        except Exception as e:
+            print(f"[-] Scrip sync background worker error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # Load master scrips on module import
@@ -287,36 +315,66 @@ def calculate_dte(expiry_str: str) -> int:
     return 0
 
 
+# In-memory short-term cache for live broker expiries (5 min TTL)
+LIVE_INDEX_EXPIRIES_CACHE: Dict[str, Dict[str, Any]] = {}
+
 def get_index_expiries(index_symbol: str) -> List[Dict[str, Any]]:
     """
     Returns all actual tradeable expiry dates for the selected index or contract
-    extracted from in-memory Master Scrips lookup and live Option Chain API with DTE (Days to Expiry).
+    extracted from live Kotak Neo API (client.expiries) or in-memory Master Scrips lookup.
     """
     symbol_upper = index_symbol.upper().replace(" 50", "").strip()
     today = datetime.date.today()
-    dates_set = set(INDEX_EXPIRIES_MAP.get(symbol_upper, set()))
+    now_ts = time.time()
 
-    # 1. Query Kotak Neo API Option Chain only if master CSV did not provide dates
+    # 1. Check in-memory 5-minute cache
+    cached = LIVE_INDEX_EXPIRIES_CACHE.get(symbol_upper)
+    if cached and (now_ts - cached.get("timestamp", 0) < 300):
+        return cached.get("data", [])
+
+    # 2. Check live Kotak Neo broker API via dedicated client.expiries()
     client = SESSION_DATA.get("client")
-    if not dates_set and client is not None:
+    if client is not None:
         try:
             exchange_seg = "bse_fo" if symbol_upper in ["SENSEX", "BANKEX"] else "nse_fo"
-            res = client.option_chain(exchange=exchange_seg, underlying=symbol_upper, count=1)
-            if isinstance(res, dict):
-                chain_data = res.get("data") if isinstance(res.get("data"), dict) else res
-                broker_exp = chain_data.get("common_data", {}).get("expiryDt")
-                if broker_exp:
+            res = client.expiries(exchange=exchange_seg, underlying=symbol_upper)
+            if isinstance(res, dict) and "expiries" in res and res["expiries"]:
+                valid_expiries = []
+                for exp_str in res["expiries"]:
                     try:
-                        dt = datetime.datetime.strptime(broker_exp.strip(), "%d-%b-%Y")
-                        dates_set.add(dt)
+                        exp_dt = datetime.datetime.strptime(exp_str.strip(), "%Y-%m-%d")
+                        if exp_dt.date() >= today:
+                            valid_expiries.append(exp_dt)
+                            # Register in INDEX_EXPIRIES_MAP so contract lookup recognizes it
+                            if symbol_upper not in INDEX_EXPIRIES_MAP:
+                                INDEX_EXPIRIES_MAP[symbol_upper] = set()
+                            INDEX_EXPIRIES_MAP[symbol_upper].add(exp_dt)
                     except Exception:
-                        pass
-        except Exception:
-            pass
+                        continue
 
+                if valid_expiries:
+                    valid_expiries.sort()
+                    formatted = []
+                    for dt in valid_expiries:
+                        dte = (dt.date() - today).days
+                        date_str = dt.strftime("%d-%b-%Y").upper()
+                        formatted.append({
+                            "label": f"{date_str} ({dte} DTE)",
+                            "date": date_str,
+                            "dte": dte,
+                            "dte_label": f"{dte} DTE"
+                        })
+                    LIVE_INDEX_EXPIRIES_CACHE[symbol_upper] = {"timestamp": now_ts, "data": formatted}
+                    return formatted
+        except Exception as e:
+            print(f"[-] Kotak client.expiries notice for {symbol_upper}: {e}")
+
+    # 3. Check in-memory INDEX_EXPIRIES_MAP with gap detection
+    dates_set = set(INDEX_EXPIRIES_MAP.get(symbol_upper, set()))
     future_dates = sorted([dt for dt in dates_set if dt.date() >= today])
 
-    if future_dates:
+    # If the nearest future date is within 7 days, use the master scrip dates
+    if future_dates and (future_dates[0].date() - today).days <= 7:
         result = []
         for dt in future_dates:
             dte = (dt.date() - today).days
@@ -329,8 +387,8 @@ def get_index_expiries(index_symbol: str) -> List[Dict[str, Any]]:
             })
         return result
 
-    # Fallback default schedule
-    weekday_map = {"MIDCPNIFTY": 0, "FINNIFTY": 1, "BANKNIFTY": 2, "NIFTY": 3, "SENSEX": 4}
+    # 4. Fallback: Dynamic calendar-based weekly expiry generation
+    weekday_map = {"MIDCPNIFTY": 0, "FINNIFTY": 1, "BANKNIFTY": 2, "NIFTY": 3, "SENSEX": 4, "BANKEX": 0}
     target_dow = weekday_map.get(symbol_upper, 3)
 
     days_ahead = (target_dow - today.weekday()) % 7
@@ -345,10 +403,23 @@ def get_index_expiries(index_symbol: str) -> List[Dict[str, Any]]:
     curr_str = curr_week.strftime("%d-%b-%Y").upper()
     next_str = next_week.strftime("%d-%b-%Y").upper()
 
-    return [
+    fallback_result = [
         {"label": f"{curr_str} ({curr_dte} DTE)", "date": curr_str, "dte": curr_dte, "dte_label": f"{curr_dte} DTE"},
         {"label": f"{next_str} ({next_dte} DTE)", "date": next_str, "dte": next_dte, "dte_label": f"{next_dte} DTE"}
     ]
+    # Append any remaining future dates from master scrip
+    for dt in future_dates:
+        date_str = dt.strftime("%d-%b-%Y").upper()
+        if date_str not in [curr_str, next_str]:
+            dte = (dt.date() - today).days
+            fallback_result.append({
+                "label": f"{date_str} ({dte} DTE)",
+                "date": date_str,
+                "dte": dte,
+                "dte_label": f"{dte} DTE"
+            })
+
+    return fallback_result
 
 
 
@@ -601,12 +672,8 @@ def login_route():
             except Exception as e:
                 print(f"[-] Index WS Launch Notice: {e}")
 
-            # Download fresh master scrip files from Kotak Neo broker server
-            try:
-                print("[*] Downloading latest Master Scrip CSV files from Kotak Neo...")
-                client.scrip_master()
-            except Exception as e:
-                print(f"[-] Scrip Master Download Notice: {e}")
+            # Download fresh master scrip files from Kotak Neo broker server in background & reload
+            sync_master_scrips_in_background(client)
 
             return jsonify({
                 "success": True,
@@ -1608,7 +1675,7 @@ def create_tbs_strategy():
         target_strat["sl"] = sl_desc
         target_strat["strikeSelection"] = strike_desc
         target_strat["scripIndex"] = data.get("scripIndex", "NIFTY 50 (NSE_FO)")
-        target_strat["strategyExpiry"] = (lambda: data.get("strategyExpiry") or (get_index_expiries(data.get("index", "NIFTY"))[0]["date"] if get_index_expiries(data.get("index", "NIFTY")) else "06-OCT-2026"))()
+        target_strat["strategyExpiry"] = data.get("strategyExpiry") or (get_index_expiries(data.get("index", "NIFTY"))[0]["date"] if get_index_expiries(data.get("index", "NIFTY")) else datetime.date.today().strftime("%d-%b-%Y").upper())
         target_strat["entryType"] = data.get("entryType", "Time Based")
         target_strat["exitType"] = data.get("exitType", "Time Based")
         target_strat["productCode"] = data.get("productCode", "NRML (Normal Carrying)")
@@ -1654,7 +1721,7 @@ def create_tbs_strategy():
         
         # Extended General Settings
         "scripIndex": data.get("scripIndex", "NIFTY 50 (NSE_FO)"),
-        "strategyExpiry": (lambda: data.get("strategyExpiry") or (get_index_expiries(data.get("index", "NIFTY"))[0]["date"] if get_index_expiries(data.get("index", "NIFTY")) else "06-OCT-2026"))(),
+        "strategyExpiry": data.get("strategyExpiry") or (get_index_expiries(data.get("index", "NIFTY"))[0]["date"] if get_index_expiries(data.get("index", "NIFTY")) else datetime.date.today().strftime("%d-%b-%Y").upper()),
         "entryType": data.get("entryType", "Time Based"),
         "exitType": data.get("exitType", "Time Based"),
         "productCode": data.get("productCode", "NRML (Normal Carrying)"),
@@ -1762,6 +1829,7 @@ def manual_entry_tbs_strategy():
                 if isinstance(res, dict) and (res.get("nOrdNo") or res.get("stat") == "Ok"):
                     confirmed_no = res.get("nOrdNo", order_ref)
                     print(f"[+] Manual Desk Limit Order Executed with Kotak Neo! Order No: {confirmed_no}")
+                    leg["entryOrderNo"] = str(confirmed_no)
                     leg["executedSymbol"] = symbol_name
                     leg["executedStrike"] = strike
                     leg["executedEntryPrice"] = option_ltp
@@ -1810,7 +1878,12 @@ def manual_entry_tbs_strategy():
             print(f"[-] Manual Desk Order Placement Notice: {e}")
 
     target_strat["orderId"] = order_ref
-    target_strat["entryPrice"] = 140.0
+    first_p = float(target_strat["legs"][0].get("executedEntryPrice", 140.0)) if target_strat.get("legs") else 140.0
+    target_strat["entryPrice"] = round(first_p, 2)
+
+    # Hybrid Execution Phase 2: Background Trade Fill Reconciliation & SL Fine-Tuning
+    if client is not None:
+        reconcile_entry_fills_and_sl_in_background(target_strat, client)
 
     return jsonify({
         "success": True,
@@ -2018,6 +2091,7 @@ def execute_strategy_entry(target_strat: dict) -> dict:
                         log_system_event(f"KOTAK API ENTRY NOTICE Leg #{idx+1} ({symbol_name}): {res}", "WARN")
 
                 if confirmed_order_no:
+                    leg["entryOrderNo"] = str(confirmed_order_no)
                     log_system_event(f"[ENTRY ORDER FILLED] Leg #{idx+1} {symbol_name}: Kotak Neo Order No: {confirmed_order_no} | Fill Price: ₹{leg_ltp:.2f}", "SUCCESS")
 
                     # IMMEDIATELY submit matching Stoploss order if Stoploss is enabled for this leg
@@ -2140,7 +2214,158 @@ def execute_strategy_entry(target_strat: dict) -> dict:
         log_system_event(f"[MOVE SL TO COST ARMED] Strategy '{target_strat['name']}' has Move SL to Cost enabled across {len(legs)} legs. Launching 500ms order-book polling...", "INFO")
         threading.Thread(target=poll_order_book_and_adjust_sl, args=(target_strat["id"],), daemon=True).start()
 
+    # Hybrid Execution Phase 2: Background Trade Fill Reconciliation & SL Fine-Tuning
+    if client is not None:
+        reconcile_entry_fills_and_sl_in_background(target_strat, client)
+
     return target_strat
+
+
+def reconcile_entry_fills_and_sl_in_background(target_strat: dict, client):
+    """
+    Hybrid Execution Phase 2:
+    Runs in background after entry & SL orders are placed.
+    Queries Kotak Neo order report and positions to retrieve the actual exchange
+    fill execution prices (e.g. ₹99.60 vs estimated ₹100.00).
+    Reconciles leg['executedEntryPrice'] so application MTM matches Kotak Neo to the exact paisa,
+    and fine-tunes pending Stop-Loss orders if the fill differed from the pre-order quote.
+    """
+    def _reconcile_worker():
+        if client is None:
+            return
+        # Brief 0.6s delay for exchange matching and broker trade ledger update
+        time.sleep(0.6)
+
+        legs = target_strat.get("legs", [])
+        sym_base = target_strat.get("symbol", "NIFTY")
+        trigger_limit_diff = float(PROFILE_SETTINGS.get("triggerLimitDiff", 1.0))
+        lot_sz = get_index_lot_size(sym_base)
+        lots = int(target_strat.get("lotsPairs", 1) or 1)
+
+        # Retry up to 3 times with 0.8s intervals
+        for attempt in range(3):
+            try:
+                # 1. Fetch order report from broker
+                order_book_res = None
+                try:
+                    order_book_res = client.order_report()
+                except Exception:
+                    pass
+
+                orders_by_id = {}
+                if isinstance(order_book_res, dict):
+                    raw_data = order_book_res.get("data")
+                    orders_list = raw_data if isinstance(raw_data, list) else [order_book_res]
+                    for o in orders_list:
+                        if isinstance(o, dict):
+                            ord_no = str(o.get("nOrdNo") or o.get("order_id") or o.get("orderNo") or "").strip()
+                            if ord_no:
+                                orders_by_id[ord_no] = o
+
+                # 2. Also fetch positions as backup
+                positions_map = {}
+                try:
+                    pos_res = client.positions()
+                    if isinstance(pos_res, dict) and isinstance(pos_res.get("data"), list):
+                        for p in pos_res["data"]:
+                            if isinstance(p, dict):
+                                ts = str(p.get("trdSym") or "").strip()
+                                if ts:
+                                    positions_map[ts] = p
+                except Exception:
+                    pass
+
+                reconciled_any = False
+                for idx, leg in enumerate(legs):
+                    sym = leg.get("executedSymbol", "")
+                    entry_ord_no = str(leg.get("entryOrderNo", "")).strip()
+                    pos = leg.get("position", "Sell").upper()
+                    old_entry = float(leg.get("executedEntryPrice", 0.0))
+
+                    real_fill_price = None
+
+                    # Check order report first
+                    if entry_ord_no and entry_ord_no in orders_by_id:
+                        ord_obj = orders_by_id[entry_ord_no]
+                        st = str(ord_obj.get("ordSt") or ord_obj.get("status") or "").lower()
+                        if st in ["complete", "traded", "executed", "filled"]:
+                            try:
+                                avg_p = float(ord_obj.get("avgPrc") or ord_obj.get("flPrc") or 0.0)
+                                if avg_p > 0:
+                                    real_fill_price = round(avg_p, 2)
+                            except (ValueError, TypeError):
+                                pass
+
+                    # Fallback to positions if order report didn't have avgPrc
+                    if real_fill_price is None and sym in positions_map:
+                        pos_obj = positions_map[sym]
+                        try:
+                            avg_key = "sellAvgPrc" if pos in ["SELL", "S"] else "buyAvgPrc"
+                            avg_val = float(pos_obj.get(avg_key) or pos_obj.get("avgPrc") or 0.0)
+                            if avg_val > 0:
+                                real_fill_price = round(avg_val, 2)
+                        except (ValueError, TypeError):
+                            pass
+
+                    if real_fill_price and real_fill_price > 0:
+                        diff = abs(real_fill_price - old_entry)
+                        if diff >= 0.01:
+                            leg["executedEntryPrice"] = real_fill_price
+                            reconciled_any = True
+                            log_system_event(
+                                f"[HYBRID FILL RECONCILED] Leg #{idx+1} ({sym}): Actual Broker Fill: ₹{real_fill_price:.2f} (Estimated was ₹{old_entry:.2f}). App MTM synchronized 100%!",
+                                "SUCCESS"
+                            )
+
+                            # Fine-tune matching SL order if present
+                            sl_ord_no = str(leg.get("slOrderNo", "")).strip()
+                            sl_enable = leg.get("slEnable", True)
+                            sl_val = float(leg.get("slValue", 0) or 0)
+                            sl_type = str(leg.get("slType", "Points (Pts)"))
+
+                            if sl_ord_no and not sl_ord_no.startswith("SIM-") and sl_enable and sl_val > 0:
+                                new_sl_trigger, new_sl_limit, _ = calculate_sl_prices(
+                                    entry_price=real_fill_price,
+                                    leg_action=pos,
+                                    sl_val=sl_val,
+                                    sl_type=sl_type,
+                                    trigger_limit_diff=trigger_limit_diff
+                                )
+                                old_sl_trigger = float(leg.get("slTriggerPrice", 0.0))
+                                if abs(new_sl_trigger - old_sl_trigger) >= 0.05:
+                                    leg_lots = int(leg.get("lots", lots))
+                                    leg_qty = str(leg_lots * lot_sz)
+                                    try:
+                                        mod_res = client.modify_order(
+                                            order_id=sl_ord_no,
+                                            price=str(new_sl_limit),
+                                            order_type="SL",
+                                            quantity=leg_qty,
+                                            validity="DAY",
+                                            trigger_price=str(new_sl_trigger)
+                                        )
+                                        if isinstance(mod_res, dict) and (mod_res.get("nOrdNo") or mod_res.get("stat") == "Ok"):
+                                            leg["slTriggerPrice"] = new_sl_trigger
+                                            leg["slLimitPrice"] = new_sl_limit
+                                            log_system_event(
+                                                f"[HYBRID SL RE-ALIGNED] Leg #{idx+1} ({sym}): Broker SL Order #{sl_ord_no} updated to ₹{new_sl_trigger:.2f} (aligned to real fill ₹{real_fill_price:.2f})",
+                                                "SUCCESS"
+                                            )
+                                    except Exception as me:
+                                        print(f"[-] SL fine-tune exception for Leg #{idx+1}: {me}")
+
+                if reconciled_any:
+                    first_leg_entry = float(legs[0].get("executedEntryPrice", 0.0)) if legs else 0.0
+                    if first_leg_entry > 0:
+                        target_strat["entryPrice"] = first_leg_entry
+                    break # Successfully reconciled all legs!
+
+            except Exception as e:
+                print(f"[-] Reconcile worker error on attempt {attempt+1}: {e}")
+
+            time.sleep(0.8)
+
+    threading.Thread(target=_reconcile_worker, daemon=True).start()
 
 
 def trigger_tbs_modify_stoploss_to_cost(target_strat: dict, hit_leg_idx: int, hit_order_no: str) -> None:
@@ -2730,6 +2955,26 @@ def start_background_scheduler():
                         now_ts = time.time()
                         if now_ts - s.get("_last_monitor_ts", 0) >= 10:
                             s["_last_monitor_ts"] = now_ts
+
+                            # Continuous Broker Position Price Reconciliation (Keeps MTM Penny-Synced)
+                            client = SESSION_DATA.get("client")
+                            if client is not None:
+                                try:
+                                    b_positions = get_cached_broker_positions(client, max_age_sec=6.0)
+                                    for leg in legs:
+                                        leg_sym = leg.get("executedSymbol", "")
+                                        if leg_sym in b_positions:
+                                            p_info = b_positions[leg_sym]
+                                            pos_dir = leg.get("position", "Sell").upper()
+                                            avg_k = "sellAvgPrc" if pos_dir in ["SELL", "S"] else "buyAvgPrc"
+                                            b_avg = float(p_info.get(avg_k) or p_info.get("avgPrc") or 0.0)
+                                            if b_avg > 0 and abs(b_avg - float(leg.get("executedEntryPrice", 0.0))) >= 0.01:
+                                                leg["executedEntryPrice"] = round(b_avg, 2)
+                                                if leg == legs[0]:
+                                                    s["entryPrice"] = round(b_avg, 2)
+                                except Exception:
+                                    pass
+
                             first_leg = legs[0] if legs else {}
                             exec_sym = first_leg.get("executedSymbol", sym_base)
                             entry_p = float(first_leg.get("executedEntryPrice", s.get("entryPrice", 0)))
@@ -2853,14 +3098,36 @@ def attempt_auto_login_on_startup():
             SESSION_DATA["client"] = client
             SESSION_DATA["user"] = {"displayName": greeting_name, "ucc": ucc, "loginTime": time.strftime("%Y-%m-%d %H:%M:%S")}
             start_ws_index_listener(client)
+            sync_master_scrips_in_background(client)
             log_system_event(f"Kotak Neo WebSocket auto-authenticated for {ucc}! Live streaming active.", "SUCCESS")
         except Exception as e:
             print(f"[-] Auto-login startup notice: {e}")
 
 
+def open_browser_in_chrome():
+    """Automatically opens the trading dashboard in Google Chrome upon server launch."""
+    url = "http://127.0.0.1:5000"
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ]
+    import webbrowser
+    for path in chrome_paths:
+        if os.path.isfile(path):
+            try:
+                webbrowser.register("chrome", None, webbrowser.BackgroundBrowser(path))
+                webbrowser.get("chrome").open(url)
+                return
+            except Exception:
+                pass
+    webbrowser.open(url)
+
+
 if __name__ == "__main__":
     attempt_auto_login_on_startup()
     start_background_scheduler()
+    threading.Timer(1.25, open_browser_in_chrome).start()
     print("\n" + "=" * 60)
     print("      TRADING DASHBOARD WEB SERVER RUNNING")
     print("      Access App at: http://127.0.0.1:5000")

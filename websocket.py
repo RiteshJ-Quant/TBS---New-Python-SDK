@@ -18,6 +18,7 @@ import os
 import sys
 import pandas as pd
 import httpx
+import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from neo_api_client import NeoAPI
 from neo_api_client.websocket.feed import SFeedWebSocket, WsToken, SFeedScrip, SFeedScripLite
@@ -27,12 +28,38 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MASTER_DIR = os.path.join(BASE_DIR, "master_scrips")
 
 
-def download_master_scrips(client: NeoAPI) -> Dict[str, str]:
+def are_master_scrips_downloaded_today() -> bool:
+    """Checks if primary master scrip files (e.g. nse_fo.csv) exist and were modified today."""
+    key_files = ["nse_fo.csv", "bse_fo.csv"]
+    today = datetime.date.today()
+    for fname in key_files:
+        path = os.path.join(MASTER_DIR, fname)
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return False
+        file_date = datetime.date.fromtimestamp(os.path.getmtime(path))
+        if file_date != today:
+            return False
+    return True
+
+
+def download_master_scrips(client: NeoAPI, force: bool = False) -> Dict[str, str]:
     """
     Downloads Master Scrip CSV files from Kotak Neo API and saves them
-    directly into the workspace directory as well as master_scrips/ subfolder.
+    exclusively into master_scrips/ subfolder, replacing existing files.
+    Skips download if files were already downloaded today unless force=True.
     """
     os.makedirs(MASTER_DIR, exist_ok=True)
+
+    today_str = datetime.date.today().strftime("%d-%b-%Y")
+    if not force and are_master_scrips_downloaded_today():
+        print(f"[+] Master Scrips are already up-to-date for today ({today_str}). Skipping download.")
+        existing_files = {}
+        for fname in ["nse_fo.csv", "bse_fo.csv", "nse_cm.csv", "bse_cm.csv", "mcx_fo.csv", "cde_fo.csv", "nse_com.csv"]:
+            p = os.path.join(MASTER_DIR, fname)
+            if os.path.exists(p):
+                existing_files[fname] = p
+        return existing_files
+
     print("\n" + "=" * 65)
     print("        Downloading Master Scrip Files from Kotak Neo Server")
     print("=" * 65)
@@ -49,23 +76,19 @@ def download_master_scrips(client: NeoAPI) -> Dict[str, str]:
             # Clean filename (e.g. nse_cm-v1.csv -> nse_cm.csv)
             clean_filename = raw_filename.replace("-v1", "")
 
-            root_path = os.path.join(BASE_DIR, clean_filename)
-            sub_path = os.path.join(MASTER_DIR, clean_filename)
+            target_path = os.path.join(MASTER_DIR, clean_filename)
 
             print(f" -> Downloading {clean_filename}...")
             try:
                 r = httpx.get(url, timeout=60.0)
                 if r.status_code == 200:
-                    # Save to root workspace directory
-                    with open(root_path, "wb") as f:
-                        f.write(r.content)
-                    # Save to subfolder master_scrips/
-                    with open(sub_path, "wb") as f:
+                    # Save / overwrite directly in master_scrips/ subfolder
+                    with open(target_path, "wb") as f:
                         f.write(r.content)
 
-                    downloaded_files[clean_filename] = root_path
+                    downloaded_files[clean_filename] = target_path
                     size_mb = len(r.content) / (1024 * 1024)
-                    print(f"    [+] Saved: {root_path} ({size_mb:.2f} MB)")
+                    print(f"    [+] Saved (replaced): {target_path} ({size_mb:.2f} MB)")
                 else:
                     print(f"    [-] Download failed for {clean_filename}: HTTP Status {r.status_code}")
             except Exception as e:
@@ -266,15 +289,14 @@ def main():
         print(f"\n[ERROR] Authentication failed: {e}")
         sys.exit(1)
 
-    # Step 2: Check & Download Master Scrip Files automatically if missing
-    existing_path = get_master_scrip_path("nse_fo.csv")
-
-    if not existing_path:
-        print("\nMaster Scrip CSV file 'nse_fo.csv' not found locally. Downloading automatically...")
+    # Step 2: Check & Download Master Scrip Files automatically if missing or outdated
+    if not are_master_scrips_downloaded_today():
+        print("\nMaster Scrip CSV files not found or outdated for today. Downloading automatically...")
         downloaded = download_master_scrips(client)
         nse_fo_path = downloaded.get("nse_fo.csv") or get_master_scrip_path("nse_fo.csv")
     else:
-        print(f"\n[+] Using existing Master Scrip file: {existing_path}")
+        existing_path = get_master_scrip_path("nse_fo.csv")
+        print(f"\n[+] Master Scrips are up-to-date for today: {existing_path}")
         nse_fo_path = existing_path
 
     # Step 3: Load Master Scrip Dataframe
