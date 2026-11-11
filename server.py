@@ -78,6 +78,7 @@ SESSION_DATA: Dict[str, Any] = {
 
 # Live WebSocket Option Quotes Store & Token Maps
 OPTION_LIVE_PRICES: Dict[str, float] = {}             # TradingSymbol or Token -> Live LTP
+OPTION_LIVE_DEPTH: Dict[str, dict] = {}               # TradingSymbol or Token -> {"bid": float, "ask": float, "ltp": float, "updated": float}
 SYMBOL_TO_TOKEN_MAP: Dict[str, tuple] = {}            # TradingSymbol -> (Token, Segment)
 TOKEN_TO_SYMBOL_MAP: Dict[str, str] = {}              # Token -> TradingSymbol
 PENDING_WS_SUBSCRIPTIONS: set = set()                 # Set of (Segment, Token) to subscribe
@@ -153,6 +154,33 @@ def register_option_for_live_ws(trading_symbol: str, token: str = None, seg: str
         PENDING_WS_SUBSCRIPTIONS.add((seg, token))
         SYMBOL_TO_TOKEN_MAP[sym] = (token, seg)
         TOKEN_TO_SYMBOL_MAP[token] = sym
+
+
+def get_live_market_depth(trading_symbol: str) -> dict:
+    """
+    Returns {'bid': float, 'ask': float, 'ltp': float} for an option contract or symbol.
+    Checks:
+    1. OPTION_LIVE_DEPTH (real-time level 4 WebSocket touchline bids & asks)
+    2. Fallback to OPTION_LIVE_PRICES for LTP
+    """
+    if not trading_symbol:
+        return {"bid": 0.0, "ask": 0.0, "ltp": 0.0}
+
+    sym = str(trading_symbol).strip()
+    depth = OPTION_LIVE_DEPTH.get(sym)
+    if not depth and sym in SYMBOL_TO_TOKEN_MAP:
+        tok = str(SYMBOL_TO_TOKEN_MAP[sym][0])
+        depth = OPTION_LIVE_DEPTH.get(tok)
+
+    if depth:
+        return {
+            "bid": float(depth.get("bid", 0.0) or 0.0),
+            "ask": float(depth.get("ask", 0.0) or 0.0),
+            "ltp": float(depth.get("ltp", 0.0) or OPTION_LIVE_PRICES.get(sym, 0.0) or 0.0)
+        }
+
+    ltp = float(OPTION_LIVE_PRICES.get(sym, 0.0) or 0.0)
+    return {"bid": 0.0, "ask": 0.0, "ltp": ltp}
 
 
 def sync_master_scrips_in_background(api_client, force: bool = False):
@@ -484,6 +512,8 @@ def start_ws_index_listener(client):
                         high_p = 0.0
                         low_p = 0.0
                         close_p = 0.0
+                        best_bid = 0.0
+                        best_ask = 0.0
 
                         if SFeedIndex is not None and isinstance(message, SFeedIndex):
                             tok = str(message.instrument_token or "")
@@ -505,6 +535,16 @@ def start_ws_index_listener(client):
                             high_p = float(getattr(message, "high_price", ltp) or ltp)
                             low_p = float(getattr(message, "low_price", ltp) or ltp)
                             close_p = float(getattr(message, "close_price", ltp) or ltp)
+                            if hasattr(message, "buy") and message.buy:
+                                try:
+                                    best_bid = float(getattr(message.buy[0], "price", 0.0) or 0.0)
+                                except Exception:
+                                    pass
+                            if hasattr(message, "sell") and message.sell:
+                                try:
+                                    best_ask = float(getattr(message.sell[0], "price", 0.0) or 0.0)
+                                except Exception:
+                                    pass
                         elif isinstance(message, dict):
                             tok = str(message.get("tk") or message.get("instrument_token") or "")
                             name = str(message.get("trading_symbol") or message.get("tsym") or message.get("name") or "")
@@ -515,6 +555,19 @@ def start_ws_index_listener(client):
                             high_p = float(message.get("high") or message.get("high_price") or ltp)
                             low_p = float(message.get("low") or message.get("low_price") or ltp)
                             close_p = float(message.get("close") or message.get("close_price") or ltp)
+                            buy_list = message.get("buy") or message.get("depth", {}).get("buy") or []
+                            if buy_list and isinstance(buy_list, list) and len(buy_list) > 0:
+                                first_b = buy_list[0]
+                                best_bid = float(first_b.get("price", 0.0) if isinstance(first_b, dict) else getattr(first_b, "price", 0.0))
+                            elif message.get("bp") or message.get("bPrice") or message.get("buy_price"):
+                                best_bid = float(message.get("bp") or message.get("bPrice") or message.get("buy_price") or 0.0)
+
+                            sell_list = message.get("sell") or message.get("depth", {}).get("sell") or []
+                            if sell_list and isinstance(sell_list, list) and len(sell_list) > 0:
+                                first_s = sell_list[0]
+                                best_ask = float(first_s.get("price", 0.0) if isinstance(first_s, dict) else getattr(first_s, "price", 0.0))
+                            elif message.get("sp") or message.get("sPrice") or message.get("sell_price"):
+                                best_ask = float(message.get("sp") or message.get("sPrice") or message.get("sell_price") or 0.0)
                         else:
                             tok = str(getattr(message, "instrument_token", "") or getattr(message, "token", "") or "")
                             name = str(getattr(message, "trading_symbol", "") or getattr(message, "name", "") or "")
@@ -525,6 +578,16 @@ def start_ws_index_listener(client):
                             high_p = float(getattr(message, "high_price", ltp) or ltp)
                             low_p = float(getattr(message, "low_price", ltp) or ltp)
                             close_p = float(getattr(message, "close_price", ltp) or ltp)
+                            buy_attr = getattr(message, "buy", None)
+                            if buy_attr and len(buy_attr) > 0:
+                                best_bid = float(getattr(buy_attr[0], "price", 0.0) or 0.0)
+                            elif hasattr(message, "buy_price") or hasattr(message, "bp"):
+                                best_bid = float(getattr(message, "buy_price", 0.0) or getattr(message, "bp", 0.0) or 0.0)
+                            sell_attr = getattr(message, "sell", None)
+                            if sell_attr and len(sell_attr) > 0:
+                                best_ask = float(getattr(sell_attr[0], "price", 0.0) or 0.0)
+                            elif hasattr(message, "sell_price") or hasattr(message, "sp"):
+                                best_ask = float(getattr(message, "sell_price", 0.0) or getattr(message, "sp", 0.0) or 0.0)
 
                         if ltp > 0:
                             tok_str = str(tok).strip()
@@ -565,14 +628,23 @@ def start_ws_index_listener(client):
                                 s_p = MARKET_CACHE["SENSEX"]["price"]
                                 print(f"[MARKET FEED] NIFTY 50: ₹{n_p:,.2f} ({n_c:+.2f}) | SENSEX: ₹{s_p:,.2f}", flush=True)
 
-                            # Update Option Live Prices Cache
+                            # Update Option Live Prices & Level 4 Depth Cache
+                            depth_data = {
+                                "ltp": round(ltp, 2),
+                                "bid": round(best_bid, 2),
+                                "ask": round(best_ask, 2),
+                                "updated": time.time()
+                            }
                             if tok_str:
                                 OPTION_LIVE_PRICES[tok_str] = round(ltp, 2)
+                                OPTION_LIVE_DEPTH[tok_str] = depth_data
                             if name:
                                 OPTION_LIVE_PRICES[name] = round(ltp, 2)
+                                OPTION_LIVE_DEPTH[name] = depth_data
                             sym_mapped = TOKEN_TO_SYMBOL_MAP.get(tok_str)
                             if sym_mapped:
                                 OPTION_LIVE_PRICES[sym_mapped] = round(ltp, 2)
+                                OPTION_LIVE_DEPTH[sym_mapped] = depth_data
 
                             # Also map strike number if present in symbol name
                             for s_name in [sym_mapped, name]:
@@ -585,6 +657,8 @@ def start_ws_index_listener(client):
                                                 stk_val = str(int(m.group(1)))
                                                 OPTION_LIVE_PRICES[stk_val] = round(ltp, 2)
                                                 OPTION_LIVE_PRICES[f"{stk_val}_{m.group(2)}"] = round(ltp, 2)
+                                                OPTION_LIVE_DEPTH[stk_val] = depth_data
+                                                OPTION_LIVE_DEPTH[f"{stk_val}_{m.group(2)}"] = depth_data
                                             except Exception:
                                                 pass
 
@@ -741,52 +815,122 @@ def get_broker_status():
 # PROFILE & OMS LIMIT ORDER SETTINGS ENDPOINTS
 # -------------------------------------------------------------------
 
-def calculate_limit_order_price(ltp: float, action: str) -> float:
+def calculate_limit_order_price(
+    ltp: float,
+    action: str,
+    trading_symbol: str = "",
+    best_bid: float = 0.0,
+    best_ask: float = 0.0
+) -> float:
     """
-    Calculates entry price for a Limit Order (order_type='L') via Kotak Neo.
-    Formula:
-    - BUY:  Price = LTP + entry_limit_offset (marketable buy up to LTP + offset for immediate fill)
-    - SELL: Price = max(0.05, LTP - entry_limit_offset) (marketable sell down to LTP - offset for immediate fill)
+    Calculates entry price for a Limit Order (order_type='L') via Kotak Neo using
+    Approach 1: Best Bid / Best Ask Pricing (Industry Standard).
+
+    Formula & Logic:
+    - SELL order: Marketable against buyers (Best Bid).
+      Price = (Best Bid - entry_limit_offset) if Best Bid > 0 else (LTP - entry_limit_offset).
+      This guarantees the limit sell order crosses the spread and matches immediately with the
+      highest available buyer in the order book, preventing unfilled orders in illiquid strikes.
+    - BUY order: Marketable against sellers (Best Ask).
+      Price = (Best Ask + entry_limit_offset) if Best Ask > 0 else (LTP + entry_limit_offset).
+      This guarantees the limit buy order crosses the spread and matches immediately with the
+      lowest available seller in the order book.
+    - Exchange Tick Size: Strictly aligned to 0.05 multiples.
     """
     offset_type = PROFILE_SETTINGS.get("omsLimitOffsetType", "Points (₹)")
     offset_val = float(PROFILE_SETTINGS.get("omsLimitOffsetValue", 0.5))
 
-    if "Percent" in offset_type:
-        calc_offset = ltp * (offset_val / 100.0)
-    else:
-        calc_offset = offset_val
+    # Resolve live bid / ask from Level 4 WebSocket depth if not explicitly passed
+    if (best_bid <= 0 or best_ask <= 0) and trading_symbol:
+        depth = get_live_market_depth(trading_symbol)
+        if best_bid <= 0:
+            best_bid = float(depth.get("bid", 0.0) or 0.0)
+        if best_ask <= 0:
+            best_ask = float(depth.get("ask", 0.0) or 0.0)
+        if ltp <= 0:
+            ltp = float(depth.get("ltp", 0.0) or 0.0)
 
     action_upper = action.strip().upper()
-    if action_upper in ["BUY", "B"]:
-        price = ltp + calc_offset
+    is_buy = action_upper in ["BUY", "B"]
+
+    # Select base price from order book depth
+    if is_buy:
+        base_price = best_ask if best_ask > 0 else ltp
     else:
-        price = ltp - calc_offset
+        base_price = best_bid if best_bid > 0 else ltp
 
-    return round(max(0.05, price), 2)
+    if base_price <= 0:
+        base_price = ltp if ltp > 0 else 0.05
+
+    if "Percent" in offset_type:
+        calc_offset = base_price * (offset_val / 100.0)
+    else:
+        calc_offset = offset_val
+
+    if is_buy:
+        price = base_price + calc_offset
+    else:
+        price = base_price - calc_offset
+
+    price = max(0.05, price)
+    tick_aligned = round(round(price / 0.05) * 0.05, 2)
+    return max(0.05, tick_aligned)
 
 
-def calculate_exit_limit_order_price(ltp: float, close_action: str) -> float:
+def calculate_exit_limit_order_price(
+    ltp: float,
+    close_action: str,
+    trading_symbol: str = "",
+    best_bid: float = 0.0,
+    best_ask: float = 0.0
+) -> float:
     """
-    Calculates Limit Price for Exit / Square Off order (order_type='L').
-    Formula:
-    - To close short (BUY): Limit Price = LTP + offset (marketable buy up to LTP + offset)
-    - To close long (SELL): Limit Price = max(0.05, LTP - offset) (marketable sell down to LTP - offset)
+    Calculates Limit Price for Exit / Square Off order (order_type='L') using
+    Approach 1: Best Bid / Best Ask Pricing (Industry Standard).
+
+    Formula & Logic:
+    - To close short (BUY): Marketable against Best Ask (lowest seller).
+      Price = (Best Ask + offset) if Best Ask > 0 else (LTP + offset).
+    - To close long (SELL): Marketable against Best Bid (highest buyer).
+      Price = (Best Bid - offset) if Best Bid > 0 else (LTP - offset).
+    - Exchange Tick Size: Strictly aligned to 0.05 multiples.
     """
     offset_type = PROFILE_SETTINGS.get("omsLimitOffsetType", "Points (₹)")
     offset_val = float(PROFILE_SETTINGS.get("omsLimitOffsetValue", 0.5))
 
+    if (best_bid <= 0 or best_ask <= 0) and trading_symbol:
+        depth = get_live_market_depth(trading_symbol)
+        if best_bid <= 0:
+            best_bid = float(depth.get("bid", 0.0) or 0.0)
+        if best_ask <= 0:
+            best_ask = float(depth.get("ask", 0.0) or 0.0)
+        if ltp <= 0:
+            ltp = float(depth.get("ltp", 0.0) or 0.0)
+
+    act = close_action.strip().upper()
+    is_buy = act in ["BUY", "B"]
+
+    if is_buy:
+        base_price = best_ask if best_ask > 0 else ltp
+    else:
+        base_price = best_bid if best_bid > 0 else ltp
+
+    if base_price <= 0:
+        base_price = ltp if ltp > 0 else 0.05
+
     if "Percent" in offset_type:
-        calc_offset = ltp * (offset_val / 100.0)
+        calc_offset = base_price * (offset_val / 100.0)
     else:
         calc_offset = offset_val
 
-    act = close_action.strip().upper()
-    if act in ["BUY", "B"]:
-        price = ltp + calc_offset
+    if is_buy:
+        price = base_price + calc_offset
     else:
-        price = ltp - calc_offset
+        price = base_price - calc_offset
 
-    return round(max(0.05, price), 2)
+    price = max(0.05, price)
+    tick_aligned = round(round(price / 0.05) * 0.05, 2)
+    return max(0.05, tick_aligned)
 
 
 def calculate_sl_prices(entry_price: float, leg_action: str, sl_val: float, sl_type: str, trigger_limit_diff: float = 1.0, tick_size: float = 0.05) -> tuple:
@@ -989,6 +1133,8 @@ def get_option_chain_candidates(sym_base: str, opt_type: str, strategy_expiry: s
                     if stk_raw > 100000:
                         stk_raw = stk_raw / 100.0
                     ltp = float(quote.get("ltp") or quote.get("lastPrice") or 0)
+                    b_bid = float(quote.get("bp") or quote.get("bPrice") or quote.get("buyPrice") or 0.0)
+                    b_ask = float(quote.get("sp") or quote.get("sPrice") or quote.get("sellPrice") or 0.0)
                     tok = str(inst.get("pSymbol") or inst.get("pTok") or inst.get("tok") or inst.get("instrument_token") or "").strip()
                     trd_sym = str(inst.get("pSymbolName") or inst.get("pTrdSymbol") or "").strip()
                     if not trd_sym:
@@ -999,8 +1145,16 @@ def get_option_chain_candidates(sym_base: str, opt_type: str, strategy_expiry: s
                         ce_quotes[int(stk_raw)] = ltp
                         OPTION_LIVE_PRICES[trd_sym] = ltp
                         OPTION_LIVE_PRICES[str(int(stk_raw))] = ltp
+                        depth_item = {
+                            "ltp": round(ltp, 2),
+                            "bid": round(b_bid, 2),
+                            "ask": round(b_ask, 2),
+                            "updated": time.time()
+                        }
+                        OPTION_LIVE_DEPTH[trd_sym] = depth_item
                         if tok:
                             TOKEN_TO_SYMBOL_MAP[tok] = trd_sym
+                            OPTION_LIVE_DEPTH[tok] = depth_item
                             register_option_for_live_ws(trd_sym, tok, exch)
 
                 for put_item in c_data.get("put", []):
@@ -1010,6 +1164,8 @@ def get_option_chain_candidates(sym_base: str, opt_type: str, strategy_expiry: s
                     if stk_raw > 100000:
                         stk_raw = stk_raw / 100.0
                     ltp = float(quote.get("ltp") or quote.get("lastPrice") or 0)
+                    b_bid = float(quote.get("bp") or quote.get("bPrice") or quote.get("buyPrice") or 0.0)
+                    b_ask = float(quote.get("sp") or quote.get("sPrice") or quote.get("sellPrice") or 0.0)
                     tok = str(inst.get("pSymbol") or inst.get("pTok") or inst.get("tok") or inst.get("instrument_token") or "").strip()
                     trd_sym = str(inst.get("pSymbolName") or inst.get("pTrdSymbol") or "").strip()
                     if not trd_sym:
@@ -1020,8 +1176,16 @@ def get_option_chain_candidates(sym_base: str, opt_type: str, strategy_expiry: s
                         pe_quotes[int(stk_raw)] = ltp
                         OPTION_LIVE_PRICES[trd_sym] = ltp
                         OPTION_LIVE_PRICES[str(int(stk_raw))] = ltp
+                        depth_item = {
+                            "ltp": round(ltp, 2),
+                            "bid": round(b_bid, 2),
+                            "ask": round(b_ask, 2),
+                            "updated": time.time()
+                        }
+                        OPTION_LIVE_DEPTH[trd_sym] = depth_item
                         if tok:
                             TOKEN_TO_SYMBOL_MAP[tok] = trd_sym
+                            OPTION_LIVE_DEPTH[tok] = depth_item
                             register_option_for_live_ws(trd_sym, tok, exch)
 
                 OPTION_CHAIN_CACHE[base_cache_key] = {
@@ -1137,9 +1301,12 @@ def preselect_qualifying_leg_contract(sym_base: str, leg: dict, candidates: List
         strike = leg.get("executedStrike", 0)
         register_option_for_live_ws(trd_sym)
         live_p = OPTION_LIVE_PRICES.get(trd_sym, leg.get("executedEntryPrice", 0.0))
+        depth = get_live_market_depth(trd_sym)
         return {
             "strike": strike,
             "option_ltp": round(live_p, 2),
+            "best_bid": round(depth.get("bid", 0.0), 2),
+            "best_ask": round(depth.get("ask", 0.0), 2),
             "target_prem": float(leg.get("strikeValue", live_p) or live_p),
             "diff": 0.0,
             "trading_symbol": trd_sym,
@@ -1172,9 +1339,12 @@ def preselect_qualifying_leg_contract(sym_base: str, leg: dict, candidates: List
         if best_cand:
             register_option_for_live_ws(best_cand["trading_symbol"])
             latest_ltp = OPTION_LIVE_PRICES.get(best_cand["trading_symbol"], best_cand["ltp"])
+            depth = get_live_market_depth(best_cand["trading_symbol"])
             return {
                 "strike": best_cand["strike"],
                 "option_ltp": round(latest_ltp, 2),
+                "best_bid": round(depth.get("bid", 0.0), 2),
+                "best_ask": round(depth.get("ask", 0.0), 2),
                 "target_prem": target_prem,
                 "diff": round(abs(latest_ltp - target_prem), 2),
                 "trading_symbol": best_cand["trading_symbol"],
@@ -1224,10 +1394,13 @@ def preselect_qualifying_leg_contract(sym_base: str, leg: dict, candidates: List
         ltp = OPTION_LIVE_PRICES.get(trd_sym, 120.0)
 
     register_option_for_live_ws(trd_sym)
+    depth = get_live_market_depth(trd_sym)
 
     return {
         "strike": strike,
         "option_ltp": round(ltp, 2),
+        "best_bid": round(depth.get("bid", 0.0), 2),
+        "best_ask": round(depth.get("ask", 0.0), 2),
         "target_prem": float(leg.get("strikeValue", ltp) or ltp),
         "diff": 0.0,
         "trading_symbol": trd_sym,
@@ -1240,6 +1413,7 @@ def resolve_leg_strike_and_price(sym_base: str, leg: dict, strat_id: str = None,
     """
     Resolves (strike_price, option_ltp, limit_price, trading_symbol) for a given strategy leg.
     Uses pre-warmed pre-selected contract if available for zero-latency entry.
+    Calculates marketable limit price using Approach 1: Best Bid for Sell, Best Ask for Buy.
     """
     if strat_id and strat_id in PREWARM_STORE and PREWARM_STORE[strat_id].get("selected_legs"):
         sel_legs = PREWARM_STORE[strat_id]["selected_legs"]
@@ -1249,8 +1423,12 @@ def resolve_leg_strike_and_price(sym_base: str, leg: dict, strat_id: str = None,
             option_ltp = sel["option_ltp"]
             trd_sym = sel.get("trading_symbol", "")
             action = leg.get("position", "Sell").upper()
-            limit_price = calculate_limit_order_price(option_ltp, action)
-            print(f"[+] [ZERO-LATENCY ENTRY] Strategy '{strat_id}' Leg #{leg_idx+1} using pre-warmed strike {trd_sym} @ ₹{option_ltp:.2f}")
+            best_bid = float(sel.get("best_bid", 0.0) or 0.0)
+            best_ask = float(sel.get("best_ask", 0.0) or 0.0)
+            limit_price = calculate_limit_order_price(
+                option_ltp, action, trading_symbol=trd_sym, best_bid=best_bid, best_ask=best_ask
+            )
+            print(f"[+] [ZERO-LATENCY ENTRY] Strategy '{strat_id}' Leg #{leg_idx+1} using pre-warmed strike {trd_sym} @ ₹{option_ltp:.2f} (Bid: ₹{best_bid:.2f}, Ask: ₹{best_ask:.2f}, Limit: ₹{limit_price:.2f})")
             return strike, option_ltp, limit_price, trd_sym
 
     qual = preselect_qualifying_leg_contract(sym_base, leg, strategy_expiry=strategy_expiry)
@@ -1258,7 +1436,11 @@ def resolve_leg_strike_and_price(sym_base: str, leg: dict, strat_id: str = None,
     option_ltp = qual["option_ltp"]
     trd_sym = qual.get("trading_symbol", "")
     action = leg.get("position", "Sell").upper()
-    limit_price = calculate_limit_order_price(option_ltp, action)
+    best_bid = float(qual.get("best_bid", 0.0) or 0.0)
+    best_ask = float(qual.get("best_ask", 0.0) or 0.0)
+    limit_price = calculate_limit_order_price(
+        option_ltp, action, trading_symbol=trd_sym, best_bid=best_bid, best_ask=best_ask
+    )
     return strike, option_ltp, limit_price, trd_sym
 
 
@@ -1436,18 +1618,22 @@ def place_oms_manual_order():
     product = "NRML" if "NRML" in str(raw_prod).upper() else "MIS"
     user_price = float(data.get("price", 0) or 0)
     
-    # Get current LTP from market cache or fallback
-    ltp = 150.0
-    if "NIFTY" in symbol and MARKET_CACHE.get("NIFTY"):
-        ltp = MARKET_CACHE["NIFTY"]["price"]
-    elif "SENSEX" in symbol and MARKET_CACHE.get("SENSEX"):
-        ltp = MARKET_CACHE["SENSEX"]["price"]
+    # Get current live depth and LTP from market depth or cache
+    depth = get_live_market_depth(symbol)
+    ltp = depth.get("ltp", 0.0) or 150.0
+    if ltp <= 0 or ltp == 150.0:
+        if "NIFTY" in symbol and ("CE" not in symbol and "PE" not in symbol) and MARKET_CACHE.get("NIFTY"):
+            ltp = MARKET_CACHE["NIFTY"]["price"]
+        elif "SENSEX" in symbol and ("CE" not in symbol and "PE" not in symbol) and MARKET_CACHE.get("SENSEX"):
+            ltp = MARKET_CACHE["SENSEX"]["price"]
         
     final_price = user_price
     if order_type in ["L", "LIMIT"]:
         if user_price <= 0:
-            final_price = calculate_limit_order_price(ltp, action)
-        print(f"[*] Manual OMS Limit Order: Symbol={symbol}, Action={action}, Product={product}, LTP={ltp}, Final Limit Price={final_price}")
+            final_price = calculate_limit_order_price(
+                ltp, action, trading_symbol=symbol, best_bid=depth.get("bid", 0.0), best_ask=depth.get("ask", 0.0)
+            )
+        print(f"[*] Manual OMS Limit Order: Symbol={symbol}, Action={action}, Product={product}, LTP={ltp}, Bid={depth.get('bid', 0.0)}, Ask={depth.get('ask', 0.0)}, Final Limit Price={final_price}")
 
     client = SESSION_DATA.get("client")
     order_id = f"OMS-{uuid.uuid4().hex[:6].upper()}"
@@ -1504,7 +1690,8 @@ def get_live_prices():
             "NIFTY": MARKET_CACHE.get("NIFTY"),
             "SENSEX": MARKET_CACHE.get("SENSEX")
         },
-        "optionPrices": {str(k): v for k, v in OPTION_LIVE_PRICES.items()}
+        "optionPrices": {str(k): v for k, v in OPTION_LIVE_PRICES.items()},
+        "optionDepth": {str(k): v for k, v in OPTION_LIVE_DEPTH.items()}
     })
 
 
@@ -1522,7 +1709,8 @@ def stream_live_prices():
                         "NIFTY": MARKET_CACHE.get("NIFTY"),
                         "SENSEX": MARKET_CACHE.get("SENSEX")
                     },
-                    "optionPrices": {str(k): v for k, v in OPTION_LIVE_PRICES.items()}
+                    "optionPrices": {str(k): v for k, v in OPTION_LIVE_PRICES.items()},
+                    "optionDepth": {str(k): v for k, v in OPTION_LIVE_DEPTH.items()}
                 })
                 yield f"data: {payload}\n\n"
                 time.sleep(0.2)  # Push tick update every 200ms
@@ -1814,7 +2002,11 @@ def manual_entry_tbs_strategy():
                 symbol_name = trd_sym or f"{sym_base}26SEP{strike}{opt_type_code}"
                 leg_action = leg.get("position", "Buy").upper()
                 tx_type = "B" if leg_action in ["BUY", "B"] else "S"
-                print(f"[*] Placing Manual Desk Limit Order: {symbol_name}, Action={leg_action}, Qty={tot_qty}, Product={strat_prod}, Option LTP={option_ltp}, Limit Price={limit_price}...")
+                depth_info = get_live_market_depth(symbol_name)
+                b_bid = depth_info.get("bid", 0.0)
+                b_ask = depth_info.get("ask", 0.0)
+                pricing_detail = f"Best Bid: ₹{b_bid:.2f}" if tx_type == "S" else f"Best Ask: ₹{b_ask:.2f}"
+                print(f"[*] Placing Manual Desk Marketable Limit Order: {symbol_name}, Action={leg_action}, Qty={tot_qty}, Product={strat_prod}, Option LTP={option_ltp}, {pricing_detail}, Limit Price={limit_price}...")
                 res = client.place_order(
                     exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
                     trading_symbol=symbol_name,
@@ -2064,7 +2256,11 @@ def execute_strategy_entry(target_strat: dict) -> dict:
                 leg_action = leg.get("position", "Sell").upper()
                 tx_type = "B" if leg_action in ["BUY", "B"] else "S"
                 
-                log_msg = f"[ENTRY ORDER SUBMITTED] Leg #{idx+1}/{len(legs)}: Placing Limit Order for {symbol_name} ({leg_action}, Qty: {tot_qty}, Product: {strat_prod}, LTP: ₹{leg_ltp:.2f}, Limit: ₹{leg_limit:.2f})"
+                depth_info = get_live_market_depth(symbol_name)
+                b_bid = depth_info.get("bid", 0.0)
+                b_ask = depth_info.get("ask", 0.0)
+                pricing_side = f"Best Bid: ₹{b_bid:.2f}" if tx_type == "S" else f"Best Ask: ₹{b_ask:.2f}"
+                log_msg = f"[ENTRY ORDER SUBMITTED] Leg #{idx+1}/{len(legs)}: Placing Marketable Limit Order for {symbol_name} ({leg_action}, Qty: {tot_qty}, Product: {strat_prod}, LTP: ₹{leg_ltp:.2f}, {pricing_side}, Limit: ₹{leg_limit:.2f})"
                 log_system_event(log_msg, "INFO")
 
                 res = client.place_order(
@@ -2752,7 +2948,7 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
             return (leg_pnl, True)
 
         # Remaining net quantity exists -> Place Limit Order to Square Off
-        limit_price = calculate_exit_limit_order_price(exit_price, close_tx_type)
+        limit_price = calculate_exit_limit_order_price(exit_price, close_tx_type, trading_symbol=leg_sym)
         action_label = "BUY" if close_tx_type == "B" else "SELL"
         seg = "bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo"
         if leg_sym in SYMBOL_TO_TOKEN_MAP and SYMBOL_TO_TOKEN_MAP[leg_sym][1]:
