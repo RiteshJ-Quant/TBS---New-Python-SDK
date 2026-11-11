@@ -2768,6 +2768,156 @@ def poll_order_book_and_adjust_sl(strat_id: str):
         time.sleep(0.5)
 
 
+def chase_and_confirm_exit_order(
+    client,
+    order_id: str,
+    trading_symbol: str,
+    close_tx_type: str,
+    initial_limit_price: float,
+    quantity: int,
+    max_attempts: int = 4,
+    check_interval: float = 1.5
+) -> tuple:
+    """
+    Exit Order Chaser: Actively verifies that a square-off limit order gets filled on the exchange.
+    If the order remains OPEN/UNFILLED after each check_interval, it queries the live market depth
+    and calls client.modify_order() to step up (for BUY) or step down (for SELL) the price to the
+    latest Best Ask/Bid until the order is 100% filled.
+
+    Returns:
+        (is_filled: bool, final_fill_price: float)
+    """
+    current_price = initial_limit_price
+    is_buy = str(close_tx_type).upper() in ["BUY", "B"]
+    offset_type = PROFILE_SETTINGS.get("omsLimitOffsetType", "Points (₹)")
+    offset_val = float(PROFILE_SETTINGS.get("omsLimitOffsetValue", 0.5))
+
+    for attempt in range(max_attempts + 1):
+        # Allow matching engine to execute
+        time.sleep(check_interval)
+
+        # 1. Primary Check: Broker Live Positions (Did net quantity drop to 0?)
+        try:
+            pos_res = client.positions()
+            if isinstance(pos_res, dict) and isinstance(pos_res.get("data"), list):
+                for cp in pos_res["data"]:
+                    if str(cp.get("trdSym", "")).strip() == trading_symbol:
+                        net_q = 0
+                        if "netQty" in cp and cp.get("netQty") is not None:
+                            net_q = int(float(cp["netQty"]))
+                        else:
+                            net_q = int(float(cp.get("cfBuyQty", 0))) + int(float(cp.get("flBuyQty", 0))) - int(float(cp.get("cfSellQty", 0))) - int(float(cp.get("flSellQty", 0)))
+                        if net_q == 0:
+                            log_system_event(
+                                f"[EXIT CHASER: CONFIRMED FILLED] {trading_symbol} net open quantity is 0 on broker positions! (Order #{order_id})",
+                                "SUCCESS"
+                            )
+                            return True, current_price
+        except Exception:
+            pass
+
+        # 2. Secondary Check: Order Status via client.order_report()
+        try:
+            ord_res = client.order_report(order_id=str(order_id))
+            ord_data = None
+            if isinstance(ord_res, dict):
+                raw = ord_res.get("data")
+                if isinstance(raw, list) and len(raw) > 0:
+                    ord_data = raw[0]
+                elif isinstance(raw, dict):
+                    ord_data = raw
+                elif ord_res.get("nOrdNo"):
+                    ord_data = ord_res
+
+            if ord_data and isinstance(ord_data, dict):
+                st = str(ord_data.get("ordSt") or ord_data.get("status") or ord_data.get("orderStatus") or "").upper()
+                avg_p = float(ord_data.get("avgPrc") or ord_data.get("avgPrice") or ord_data.get("flPrc") or current_price or 0.0)
+
+                # Terminal complete states
+                if st in ["TRAD", "COMPLETE", "EXECUTED", "FILLED"]:
+                    log_system_event(
+                        f"[EXIT CHASER: CONFIRMED FILLED] {trading_symbol} Order #{order_id} filled @ ₹{avg_p:.2f} (Status: {st})!",
+                        "SUCCESS"
+                    )
+                    return True, avg_p
+
+                if st in ["CAN", "CANCELLED", "REJ", "REJECTED"]:
+                    log_system_event(
+                        f"[EXIT CHASER NOTICE] {trading_symbol} Order #{order_id} ended with status: {st}.",
+                        "WARN"
+                    )
+                    return False, current_price
+        except Exception:
+            pass
+
+        # If we reached maximum chase attempts, break to final check
+        if attempt >= max_attempts:
+            break
+
+        # 3. Order is still OPEN -> Query fresh depth and chase the price!
+        depth = get_live_market_depth(trading_symbol)
+        fresh_bid = float(depth.get("bid", 0.0) or 0.0)
+        fresh_ask = float(depth.get("ask", 0.0) or 0.0)
+        fresh_ltp = float(depth.get("ltp", 0.0) or 0.0)
+
+        # Calculate next chased price
+        if is_buy:
+            # Closing short position: chase lowest seller (Ask)
+            base_p = fresh_ask if fresh_ask > 0 else (fresh_ltp if fresh_ltp > 0 else current_price)
+            step_offset = base_p * (offset_val / 100.0) if "Percent" in offset_type else offset_val
+            target_p = base_p + step_offset
+            # Step up at least 0.50 points higher than previous limit price
+            new_price = max(target_p, current_price + 0.50)
+        else:
+            # Closing long position: chase highest buyer (Bid)
+            base_p = fresh_bid if fresh_bid > 0 else (fresh_ltp if fresh_ltp > 0 else current_price)
+            step_offset = base_p * (offset_val / 100.0) if "Percent" in offset_type else offset_val
+            target_p = base_p - step_offset
+            # Step down at least 0.50 points lower than previous limit price
+            new_price = min(target_p, current_price - 0.50)
+
+        new_price = max(0.05, round(round(new_price / 0.05) * 0.05, 2))
+
+        log_system_event(
+            f"[EXIT CHASER: RE-PRICING #{attempt+1}/{max_attempts}] {trading_symbol} Order #{order_id} still OPEN! Chasing limit price: ₹{current_price:.2f} -> ₹{new_price:.2f} (Depth: Bid ₹{fresh_bid:.2f}, Ask ₹{fresh_ask:.2f})...",
+            "WARN"
+        )
+
+        try:
+            mod_res = client.modify_order(
+                order_id=str(order_id),
+                price=str(new_price),
+                order_type="L",
+                quantity=str(quantity),
+                validity="DAY"
+            )
+            if isinstance(mod_res, dict):
+                st_code = mod_res.get("stCode")
+                if st_code == 100003 or "complete" in str(mod_res.get("errMsg", "")).lower():
+                    log_system_event(
+                        f"[EXIT CHASER: ALREADY FILLED] {trading_symbol} Order #{order_id} filled while modifying!",
+                        "SUCCESS"
+                    )
+                    return True, current_price
+            current_price = new_price
+        except Exception as me:
+            log_system_event(f"Exit Chaser modify_order notice: {me}", "WARN")
+
+    # Final positions check after all chase attempts
+    try:
+        pos_check = client.positions()
+        if isinstance(pos_check, dict) and isinstance(pos_check.get("data"), list):
+            for cp in pos_check["data"]:
+                if str(cp.get("trdSym", "")).strip() == trading_symbol:
+                    cq = int(float(cp.get("netQty", 0) if cp.get("netQty") is not None else 0))
+                    if cq == 0:
+                        return True, current_price
+    except Exception:
+        pass
+
+    return False, current_price
+
+
 def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME") -> dict:
     """
     Executes the 3-Step Strategy Exit and Square-Off Sequence:
@@ -2976,14 +3126,35 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
                     if isinstance(res, dict) and (res.get("nOrdNo") or res.get("stat") == "Ok"):
                         ord_id = res.get("nOrdNo") or res.get("result")
                         leg["exitOrderNo"] = str(ord_id)
-                        leg["isClosed"] = True
-                        leg["exitFailed"] = False
                         log_system_event(
-                            f"[EXIT ORDER FILLED] Leg #{idx+1} ({leg_sym}) squared off successfully! Broker Order: #{ord_id}",
-                            "SUCCESS"
+                            f"[EXIT ORDER SUBMITTED] Leg #{idx+1} ({leg_sym}): Broker Order #{ord_id} placed @ Limit ₹{limit_price:.2f}. Launching Exit Order Chaser...",
+                            "INFO"
                         )
-                        success = True
-                        break
+                        is_filled, final_fill_p = chase_and_confirm_exit_order(
+                            client=client,
+                            order_id=str(ord_id),
+                            trading_symbol=leg_sym,
+                            close_tx_type=close_tx_type,
+                            initial_limit_price=limit_price,
+                            quantity=net_qty,
+                            max_attempts=4,
+                            check_interval=1.5
+                        )
+                        if is_filled:
+                            leg["isClosed"] = True
+                            leg["exitFailed"] = False
+                            leg["executedExitPrice"] = final_fill_p
+                            log_system_event(
+                                f"[EXIT ORDER FILLED] Leg #{idx+1} ({leg_sym}) squared off successfully @ ₹{final_fill_p:.2f}! Broker Order: #{ord_id}",
+                                "SUCCESS"
+                            )
+                            success = True
+                            break
+                        else:
+                            log_system_event(
+                                f"[EXIT CHASER TIMEOUT] Leg #{idx+1} ({leg_sym}) order #{ord_id} could not be confirmed filled after chaser retries (Attempt #{attempt}).",
+                                "WARN"
+                            )
                     elif isinstance(res, dict) and (res.get("stat") == "Not_Ok" or res.get("stCode") == 100008):
                         log_system_event(
                             f"KOTAK API SQUARE OFF REJECTED: 401 Unauthorized (stCode: 100008). Session token expired!",
