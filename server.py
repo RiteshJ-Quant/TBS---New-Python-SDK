@@ -1454,6 +1454,331 @@ def get_strategy_product_code(strat: dict) -> str:
     return "MIS"
 
 
+def is_transport_or_disconnect_error(response_or_exc) -> bool:
+    """
+    Detects whether an order placement / modification response or exception
+    was caused by a network disconnect, stale keep-alive socket, or HTTP/2 transport drop.
+    """
+    if response_or_exc is None:
+        return False
+    if isinstance(response_or_exc, Exception):
+        exc_str = str(response_or_exc).lower()
+        if any(t in exc_str for t in [
+            "server disconnected", "disconnected", "remoteprotocolerror",
+            "connection reset", "connection closed", "broken pipe",
+            "connection aborted", "eof occurred", "handshake failure",
+            "remote end closed", "transport error", "connection error",
+            "connectionterminated", "goaway", "stream_id"
+        ]):
+            return True
+        if getattr(response_or_exc, "status", None) == 0:
+            return True
+    if isinstance(response_or_exc, dict):
+        err_val = response_or_exc.get("error") or response_or_exc.get("Error") or response_or_exc.get("errMsg") or response_or_exc.get("message")
+        if err_val is not None:
+            if isinstance(err_val, Exception):
+                return is_transport_or_disconnect_error(err_val)
+            err_str = str(err_val).lower()
+            if any(t in err_str for t in [
+                "server disconnected", "disconnected", "remoteprotocolerror",
+                "connection reset", "connection closed", "broken pipe",
+                "connection aborted", "eof occurred", "handshake failure",
+                "remote end closed", "transport error", "connection error",
+                "connectionterminated", "goaway", "stream_id"
+            ]):
+                return True
+        full_str = str(response_or_exc).lower()
+        if (
+            "server disconnected" in full_str
+            or "remoteprotocolerror" in full_str
+            or ("(0)" in full_str and "disconnect" in full_str)
+            or "connectionterminated" in full_str
+            or "goaway" in full_str
+        ):
+            return True
+        if response_or_exc.get("stCode") == 0 or response_or_exc.get("status") == 0 or response_or_exc.get("status_code") == 0:
+            return True
+    return False
+
+
+def refresh_client_http_session(client) -> bool:
+    """
+    Closes the existing httpx session and recreates a fresh connection pool
+    to purge dead/stale HTTP/2 sockets after broker idle timeouts.
+    """
+    if client is None:
+        return False
+    try:
+        rc = getattr(client, "api_client", None)
+        if rc and hasattr(rc, "rest_client"):
+            rc = rc.rest_client
+        elif hasattr(client, "rest_client"):
+            rc = client.rest_client
+
+        if rc and hasattr(rc, "session"):
+            try:
+                rc.session.close()
+            except Exception:
+                pass
+            if hasattr(rc, "_create_session"):
+                rc.session = rc._create_session()
+                print("[+] Refreshed Kotak Neo HTTP/2 session and connection pool.")
+                return True
+    except Exception as ex:
+        print(f"[-] Failed to refresh Kotak Neo HTTP session: {ex}")
+    return False
+
+
+def safe_place_order_with_retry(client, max_retries: int = 2, retry_delay: float = 0.25, **order_kwargs) -> dict:
+    """
+    Executes client.place_order with automated retry on socket disconnects or stale HTTP/2 connections.
+    If Kotak's gateway drops the connection (ApiException: Server disconnected), it automatically
+    refreshes the underlying httpx session and immediately retries the order.
+    """
+    if client is None:
+        return {"error": "Broker client not connected"}
+
+    last_res = None
+    for attempt in range(max_retries + 1):
+        try:
+            res = client.place_order(**order_kwargs)
+            last_res = res
+            if is_transport_or_disconnect_error(res):
+                if attempt < max_retries:
+                    sym_label = order_kwargs.get("trading_symbol", "N/A")
+                    log_system_event(
+                        f"[SOCKET RETRY] Kotak connection dropped during place_order ({sym_label}). "
+                        f"Purging dead socket and reconnecting (Attempt {attempt+1}/{max_retries})...",
+                        "WARN"
+                    )
+                    refresh_client_http_session(client)
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    log_system_event(
+                        f"[SOCKET ERROR] Kotak place_order failed after {max_retries} socket reconnect retries: {res}",
+                        "ERROR"
+                    )
+                    return res
+            return res
+        except Exception as exc:
+            last_res = {"error": exc}
+            if is_transport_or_disconnect_error(exc):
+                if attempt < max_retries:
+                    sym_label = order_kwargs.get("trading_symbol", "N/A")
+                    log_system_event(
+                        f"[SOCKET RETRY] Exception during place_order ({sym_label}): {exc}. "
+                        f"Purging dead socket and reconnecting (Attempt {attempt+1}/{max_retries})...",
+                        "WARN"
+                    )
+                    refresh_client_http_session(client)
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    log_system_event(
+                        f"[SOCKET ERROR] Kotak place_order exception after {max_retries} retries: {exc}",
+                        "ERROR"
+                    )
+                    return {"error": exc}
+            else:
+                return {"error": exc}
+
+    return last_res or {"error": "Order placement failed"}
+
+
+def safe_modify_order_with_retry(client, max_retries: int = 2, retry_delay: float = 0.25, **modify_kwargs) -> dict:
+    """
+    Executes client.modify_order with automated retry on socket disconnects or stale HTTP/2 connections.
+    """
+    if client is None:
+        return {"error": "Broker client not connected"}
+
+    last_res = None
+    for attempt in range(max_retries + 1):
+        try:
+            res = client.modify_order(**modify_kwargs)
+            last_res = res
+            if is_transport_or_disconnect_error(res):
+                if attempt < max_retries:
+                    ord_label = modify_kwargs.get("order_id", "N/A")
+                    log_system_event(
+                        f"[SOCKET RETRY] Kotak connection dropped during modify_order (Order #{ord_label}). "
+                        f"Purging dead socket and reconnecting (Attempt {attempt+1}/{max_retries})...",
+                        "WARN"
+                    )
+                    refresh_client_http_session(client)
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    log_system_event(
+                        f"[SOCKET ERROR] Kotak modify_order failed after {max_retries} socket reconnect retries: {res}",
+                        "ERROR"
+                    )
+                    return res
+            return res
+        except Exception as exc:
+            last_res = {"error": exc}
+            if is_transport_or_disconnect_error(exc):
+                if attempt < max_retries:
+                    ord_label = modify_kwargs.get("order_id", "N/A")
+                    log_system_event(
+                        f"[SOCKET RETRY] Exception during modify_order (Order #{ord_label}): {exc}. "
+                        f"Purging dead socket and reconnecting (Attempt {attempt+1}/{max_retries})...",
+                        "WARN"
+                    )
+                    refresh_client_http_session(client)
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    log_system_event(
+                        f"[SOCKET ERROR] Kotak modify_order exception after {max_retries} retries: {exc}",
+                        "ERROR"
+                    )
+                    return {"error": exc}
+            else:
+                return {"error": exc}
+
+    return last_res or {"error": "Order modification failed"}
+
+
+def safe_cancel_order_with_retry(client, order_id: str, amo: str = "NO", max_retries: int = 2, retry_delay: float = 0.25) -> dict:
+    """
+    Executes client.cancel_order with automated retry on socket disconnects or stale HTTP/2 connections.
+    """
+    if client is None or not order_id:
+        return {"error": "Invalid client or order_id"}
+
+    last_res = None
+    for attempt in range(max_retries + 1):
+        try:
+            res = client.cancel_order(order_id=str(order_id), amo=amo)
+            last_res = res
+            if is_transport_or_disconnect_error(res):
+                if attempt < max_retries:
+                    log_system_event(
+                        f"[SOCKET RETRY] Kotak connection dropped during cancel_order (Order #{order_id}). "
+                        f"Purging dead socket and reconnecting (Attempt {attempt+1}/{max_retries})...",
+                        "WARN"
+                    )
+                    refresh_client_http_session(client)
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    log_system_event(
+                        f"[SOCKET ERROR] Kotak cancel_order failed after {max_retries} socket reconnect retries: {res}",
+                        "ERROR"
+                    )
+                    return res
+            return res
+        except Exception as exc:
+            last_res = {"error": exc}
+            if is_transport_or_disconnect_error(exc):
+                if attempt < max_retries:
+                    log_system_event(
+                        f"[SOCKET RETRY] Exception during cancel_order (Order #{order_id}): {exc}. "
+                        f"Purging dead socket and reconnecting (Attempt {attempt+1}/{max_retries})...",
+                        "WARN"
+                    )
+                    refresh_client_http_session(client)
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    log_system_event(
+                        f"[SOCKET ERROR] Kotak cancel_order exception after {max_retries} retries: {exc}",
+                        "ERROR"
+                    )
+                    return {"error": exc}
+            else:
+                return {"error": exc}
+
+    return last_res or {"error": "Order cancellation failed"}
+
+
+def cancel_pending_sl_orders_for_exited_leg(client, leg: dict, trading_symbol: str, strat_name: str = "Strategy") -> int:
+    """
+    Cancels all pending Stop-Loss orders for an EXITED leg on Kotak Neo.
+    Guarantees that:
+    1. Only the exited leg's specific symbol is cancelled (never touches other open legs or strategies).
+    2. Cancels both the recorded leg['slOrderNo'] and any live pending orders for this symbol from client.order_report().
+    3. Leaves open legs and other strategies 100% untouched.
+    """
+    if client is None or not trading_symbol:
+        return 0
+
+    cancelled_count = 0
+    known_sl_id = str(leg.get("slOrderNo", "")).strip()
+
+    # 1. Direct cancellation of recorded slOrderNo if present
+    if known_sl_id and not known_sl_id.startswith("SIM-"):
+        res = safe_cancel_order_with_retry(client, order_id=known_sl_id)
+        if isinstance(res, dict) and (res.get("stat") == "Ok" or res.get("result")):
+            cancelled_count += 1
+            leg["slStatus"] = "CANCELLED"
+            log_system_event(
+                f"[EXIT SL CANCELLED] '{strat_name}' {trading_symbol}: Stop-Loss order #{known_sl_id} cancelled successfully!",
+                "SUCCESS"
+            )
+        else:
+            log_system_event(
+                f"[EXIT SL NOTICE] Direct cancel for #{known_sl_id} ({trading_symbol}) returned: {res}. Checking broker order book...",
+                "INFO"
+            )
+    elif known_sl_id.startswith("SIM-"):
+        leg["slStatus"] = "CANCELLED"
+        cancelled_count += 1
+        log_system_event(f"[EXIT SL SIMULATED] Simulated Stop-Loss #{known_sl_id} marked CANCELLED.", "SUCCESS")
+
+    # 2. Broker Order Book Sweep: Query Kotak's live order book strictly for trading_symbol
+    try:
+        order_book_res = None
+        try:
+            order_book_res = client.order_report()
+        except Exception as o_err:
+            if is_transport_or_disconnect_error(o_err):
+                refresh_client_http_session(client)
+                order_book_res = client.order_report()
+
+        orders_list = []
+        if isinstance(order_book_res, dict):
+            raw = order_book_res.get("data")
+            orders_list = raw if isinstance(raw, list) else [order_book_res]
+        elif isinstance(order_book_res, list):
+            orders_list = order_book_res
+
+        PENDING_STATES = [
+            "trigger_pending", "trigger pending", "open", "pending", "open_pending",
+            "amo_req_received", "after_market_order_req_received"
+        ]
+
+        for o in orders_list:
+            if not isinstance(o, dict):
+                continue
+            o_sym = str(o.get("trdSym") or "").strip()
+            o_no = str(o.get("nOrdNo") or o.get("order_id") or o.get("orderNo") or "").strip()
+            o_st = str(o.get("ordSt") or o.get("status") or "").strip().lower()
+
+            # STRICT symbol match: ONLY cancel pending orders for THIS exited leg symbol
+            if o_sym == trading_symbol and o_no and o_st in PENDING_STATES:
+                log_system_event(
+                    f"[ORDER BOOK SWEEP] Exited symbol {trading_symbol} has lingering pending order #{o_no} (Status: '{o_st}'). Cancelling on broker...",
+                    "WARN"
+                )
+                c_res = safe_cancel_order_with_retry(client, order_id=o_no)
+                if isinstance(c_res, dict) and (c_res.get("stat") == "Ok" or c_res.get("result")):
+                    cancelled_count += 1
+                    leg["slStatus"] = "CANCELLED"
+                    log_system_event(
+                        f"[EXIT SL SWEEP SUCCESS] Exited contract {trading_symbol}: Pending order #{o_no} cancelled on broker!",
+                        "SUCCESS"
+                    )
+                else:
+                    log_system_event(f"[EXIT SL SWEEP NOTICE] Order #{o_no} cancel response: {c_res}", "INFO")
+    except Exception as sweep_ex:
+        log_system_event(f"[-] Order book sweep exception for {trading_symbol}: {sweep_ex}", "DEBUG")
+
+    return cancelled_count
+
+
 def run_prewarm_fast_loop(strat_id: str, duration_sec: int = 20):
     """
     Runs a 250ms fast loop for pre-warming (20 seconds prior to entry time).
@@ -1481,6 +1806,17 @@ def run_prewarm_fast_loop(strat_id: str, duration_sec: int = 20):
     spot_val = MARKET_CACHE.get(sym_base, {}).get("price", 0.0)
     msg_start = f"[PRE-WARM INITIATED] Strategy '{target_strat['name']}' ({sym_base} Spot: ₹{spot_val:,.2f}) | 250ms fast loop running ({duration_sec}s countdown to entry)"
     log_system_event(msg_start, "INFO")
+
+    # Pre-flight warm-up ping: Refresh HTTP/2 connection pool & verify active session so entry orders fire on hot socket
+    client = SESSION_DATA.get("client")
+    if client is not None:
+        try:
+            refresh_client_http_session(client)
+            client.positions()
+            log_system_event(f"[PRE-WARM HTTP/2 KEEPALIVE] Kotak Neo session pinged & warm for '{target_strat['name']}'.", "INFO")
+        except Exception as ping_ex:
+            log_system_event(f"[PRE-WARM PING NOTICE] Keepalive check: {ping_ex}", "WARN")
+
     start_time = time.time()
 
     while (time.time() - start_time) < duration_sec:
@@ -1641,7 +1977,8 @@ def place_oms_manual_order():
     if client is not None:
         try:
             exchange_seg = "bse_fo" if ("SENSEX" in symbol or "BANKEX" in symbol) else "nse_fo"
-            res = client.place_order(
+            res = safe_place_order_with_retry(
+                client,
                 exchange_segment=exchange_seg,
                 trading_symbol=symbol,
                 transaction_type="B" if action in ["BUY", "B"] else "S",
@@ -1997,6 +2334,8 @@ def manual_entry_tbs_strategy():
             trigger_limit_diff = float(PROFILE_SETTINGS.get("triggerLimitDiff", 1.0))
 
             def execute_single_manual_leg(idx, leg):
+                if idx > 0:
+                    time.sleep(idx * 0.05)  # 50ms stagger between parallel legs to prevent concurrent h2 stream collision
                 strike, option_ltp, limit_price, trd_sym = resolve_leg_strike_and_price(sym_base, leg, strategy_expiry=target_strat.get("strategyExpiry"))
                 opt_type_code = "CE" if leg.get("optionType", "Call").title() in ["Call", "CE"] else "PE"
                 symbol_name = trd_sym or f"{sym_base}26SEP{strike}{opt_type_code}"
@@ -2007,7 +2346,8 @@ def manual_entry_tbs_strategy():
                 b_ask = depth_info.get("ask", 0.0)
                 pricing_detail = f"Best Bid: ₹{b_bid:.2f}" if tx_type == "S" else f"Best Ask: ₹{b_ask:.2f}"
                 print(f"[*] Placing Manual Desk Marketable Limit Order: {symbol_name}, Action={leg_action}, Qty={tot_qty}, Product={strat_prod}, Option LTP={option_ltp}, {pricing_detail}, Limit Price={limit_price}...")
-                res = client.place_order(
+                res = safe_place_order_with_retry(
+                    client,
                     exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
                     trading_symbol=symbol_name,
                     transaction_type=tx_type,
@@ -2039,7 +2379,8 @@ def manual_entry_tbs_strategy():
                             sl_type=sl_type,
                             trigger_limit_diff=trigger_limit_diff
                         )
-                        sl_res = client.place_order(
+                        sl_res = safe_place_order_with_retry(
+                            client,
                             exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
                             trading_symbol=symbol_name,
                             transaction_type=sl_tx_type,
@@ -2242,6 +2583,8 @@ def execute_strategy_entry(target_strat: dict) -> dict:
     if client is not None:
         try:
             def execute_single_entry_leg(idx, leg):
+                if idx > 0:
+                    time.sleep(idx * 0.05)  # 50ms stagger between parallel legs to prevent concurrent h2 stream collision
                 leg_strike, leg_ltp, leg_limit, leg_symbol = resolve_leg_strike_and_price(
                     sym_base, leg, target_strat["id"], idx, strategy_expiry=target_strat.get("strategyExpiry")
                 )
@@ -2263,7 +2606,8 @@ def execute_strategy_entry(target_strat: dict) -> dict:
                 log_msg = f"[ENTRY ORDER SUBMITTED] Leg #{idx+1}/{len(legs)}: Placing Marketable Limit Order for {symbol_name} ({leg_action}, Qty: {tot_qty}, Product: {strat_prod}, LTP: ₹{leg_ltp:.2f}, {pricing_side}, Limit: ₹{leg_limit:.2f})"
                 log_system_event(log_msg, "INFO")
 
-                res = client.place_order(
+                res = safe_place_order_with_retry(
+                    client,
                     exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
                     trading_symbol=symbol_name,
                     transaction_type=tx_type,
@@ -2307,7 +2651,8 @@ def execute_strategy_entry(target_strat: dict) -> dict:
 
                         log_system_event(f"[STOPLOSS ORDER SUBMITTED] Leg #{idx+1} ({symbol_name}): {sl_tx_type} | Product: {strat_prod} | Trigger: ₹{sl_trigger:.2f} | Limit: ₹{sl_limit:.2f}", "INFO")
 
-                        sl_res = client.place_order(
+                        sl_res = safe_place_order_with_retry(
+                            client,
                             exchange_segment="bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo",
                             trading_symbol=symbol_name,
                             transaction_type=sl_tx_type,
@@ -2532,7 +2877,8 @@ def reconcile_entry_fills_and_sl_in_background(target_strat: dict, client):
                                     leg_lots = int(leg.get("lots", lots))
                                     leg_qty = str(leg_lots * lot_sz)
                                     try:
-                                        mod_res = client.modify_order(
+                                        mod_res = safe_modify_order_with_retry(
+                                            client,
                                             order_id=sl_ord_no,
                                             price=str(new_sl_limit),
                                             order_type="SL",
@@ -2610,7 +2956,8 @@ def trigger_tbs_modify_stoploss_to_cost(target_strat: dict, hit_leg_idx: int, hi
 
         if client is not None and rem_sl_order_no and not str(rem_sl_order_no).startswith("SIM-"):
             try:
-                mod_res = client.modify_order(
+                mod_res = safe_modify_order_with_retry(
+                    client,
                     order_id=str(rem_sl_order_no),
                     price=str(new_limit_price),
                     order_type="SL",
@@ -2884,7 +3231,8 @@ def chase_and_confirm_exit_order(
         )
 
         try:
-            mod_res = client.modify_order(
+            mod_res = safe_modify_order_with_retry(
+                client,
                 order_id=str(order_id),
                 price=str(new_price),
                 order_type="L",
@@ -2955,43 +3303,24 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
     )
 
     # -------------------------------------------------------------------------
-    # STEP 1: CANCEL ANY OPEN STOPLOSS ORDERS CONCURRENTLY (client.cancel_order())
+    # STEP 1: PRE-FLIGHT VERIFICATION & SESSION KEEPALIVE FOR EXIT
     # -------------------------------------------------------------------------
     log_system_event(
-        f"[EXIT STEP 1/3] Checking and cancelling open stoploss orders concurrently for '{target_strat['name']}'...",
+        f"[EXIT STEP 1/3] Refreshing broker keepalive session and verifying active contracts for '{target_strat['name']}'...",
         "INFO"
     )
+    if client is not None:
+        try:
+            refresh_client_http_session(client)
+        except Exception:
+            pass
 
-    def cancel_single_leg_sl(idx, leg):
-        sl_ord_no = str(leg.get("slOrderNo", "")).strip()
-        leg_sym = leg.get("executedSymbol", f"Leg #{idx+1}")
-        if not sl_ord_no:
-            return
-        if leg.get("slHit", False) or leg.get("slStatus") in ["COMPLETE", "CANCELLED", "REJECTED"]:
-            return
-
-        log_system_event(
-            f"[EXIT STEP 1/3: CANCEL SL] Cancelling open stoploss order #{sl_ord_no} for Leg #{idx+1} ({leg_sym})...",
-            "WARN"
-        )
-        if client is not None and not sl_ord_no.startswith("SIM-"):
-            try:
-                cancel_res = client.cancel_order(order_id=str(sl_ord_no), amo="NO")
-                stat = cancel_res.get("stat") if isinstance(cancel_res, dict) else str(cancel_res)
-                leg["slStatus"] = "CANCELLED"
-                log_system_event(
-                    f"[EXIT STEP 1/3: SL CANCELLED] Stoploss order #{sl_ord_no} cancelled successfully (Status: {stat})",
-                    "SUCCESS"
-                )
-            except Exception as ce:
-                leg["slStatus"] = "CANCELLED"
-                log_system_event(f"[-] Kotak Neo cancel_order notice for #{sl_ord_no}: {ce}", "DEBUG")
-        else:
-            leg["slStatus"] = "CANCELLED"
-            log_system_event(f"[EXIT STEP 1/3: SIMULATED CANCEL] Simulated stoploss order #{sl_ord_no} cancelled.", "SUCCESS")
-
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(legs)))) as executor:
-        list(executor.map(lambda it: cancel_single_leg_sl(it[0], it[1]), enumerate(legs)))
+    # Cancel SL orders ONLY for legs that were ALREADY closed earlier (e.g. SL hit earlier in the day)
+    # Open legs retain their Stop-Loss until their square-off order is confirmed filled in Step 3!
+    for idx, leg in enumerate(legs):
+        leg_sym = leg.get("executedSymbol", "")
+        if (leg.get("slHit", False) or leg.get("isClosed", False) or leg.get("slStatus") == "COMPLETE") and leg_sym:
+            cancel_pending_sl_orders_for_exited_leg(client, leg, leg_sym, strat_name=target_strat.get("name", "Strategy"))
 
     # -------------------------------------------------------------------------
     # STEP 2: RESOLVE CURRENT MARKET PRICES FROM REAL-TIME WEBSOCKET (0ms Latency)
@@ -3095,6 +3424,8 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
                 f"[EXIT STEP 3/3: LEG SQUARED-OFF] Leg #{idx+1} ({leg_sym}): Net open quantity is 0 (already closed via Stoploss/Trade). Skipping order placement. P&L: {'+' if leg_pnl>=0 else ''}₹{leg_pnl:.2f}",
                 "INFO"
             )
+            if client is not None and leg_sym:
+                cancel_pending_sl_orders_for_exited_leg(client, leg, leg_sym, strat_name=target_strat.get("name", "Strategy"))
             return (leg_pnl, True)
 
         # Remaining net quantity exists -> Place Limit Order to Square Off
@@ -3113,7 +3444,8 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
             success = False
             for attempt in range(1, 3):
                 try:
-                    res = client.place_order(
+                    res = safe_place_order_with_retry(
+                        client,
                         exchange_segment=seg,
                         trading_symbol=leg_sym,
                         transaction_type=close_tx_type,
@@ -3148,6 +3480,8 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
                                 f"[EXIT ORDER FILLED] Leg #{idx+1} ({leg_sym}) squared off successfully @ ₹{final_fill_p:.2f}! Broker Order: #{ord_id}",
                                 "SUCCESS"
                             )
+                            # Once this leg's order gets exited at exit time -> cancel all pending SL orders for this exited leg:
+                            cancel_pending_sl_orders_for_exited_leg(client, leg, leg_sym, strat_name=target_strat.get("name", "Strategy"))
                             success = True
                             break
                         else:
@@ -3179,6 +3513,8 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
                                     leg["isClosed"] = True
                                     leg["exitFailed"] = False
                                     log_system_event(f"[EXIT CONFIRMED] Leg #{idx+1} ({leg_sym}) verified closed on broker positions despite timeout!", "SUCCESS")
+                                    # Cancel pending SL for this exited leg
+                                    cancel_pending_sl_orders_for_exited_leg(client, leg, leg_sym, strat_name=target_strat.get("name", "Strategy"))
                                     success = True
                                     break
                     except Exception:
@@ -3190,7 +3526,7 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
                 leg["isClosed"] = False
                 leg["exitFailed"] = True
                 log_system_event(
-                    f"[CRITICAL ERROR] Leg #{idx+1} ({leg_sym}) FAILED to square off due to broker timeout/rejection! Position is STILL OPEN. Please square off via Manual Desk!",
+                    f"[CRITICAL ERROR] Leg #{idx+1} ({leg_sym}) FAILED to square off due to broker timeout/rejection! Position is STILL OPEN. Stop-Loss order remains active to protect open leg. Please square off via Manual Desk!",
                     "ERROR"
                 )
                 return (leg_pnl, False)
@@ -3200,6 +3536,7 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
             leg["exitOrderNo"] = f"SIM-EXIT-{idx+1}"
             leg["isClosed"] = True
             leg["exitFailed"] = False
+            cancel_pending_sl_orders_for_exited_leg(client, leg, leg_sym, strat_name=target_strat.get("name", "Strategy"))
             log_system_event(
                 f"[SIMULATED SQUARE-OFF] Leg #{idx+1} ({leg_sym}): Squared off {net_qty} Qty ({action_label}) @ ₹{limit_price:.2f} (LTP: ₹{exit_price:.2f}). P&L: {'+' if leg_pnl>=0 else ''}₹{leg_pnl:.2f}",
                 "SUCCESS"
@@ -3215,6 +3552,13 @@ def execute_strategy_exit(target_strat: dict, reason: str = "SCHEDULED_EXIT_TIME
                 total_realized_pnl += leg_pnl_val
             except Exception as fe:
                 log_system_event(f"Square-off worker error: {fe}", "ERROR")
+
+    # Post-execution safety pass: cancel pending SL only for confirmed closed legs (leaving open legs untouched)
+    if client is not None:
+        for idx, leg in enumerate(legs):
+            leg_sym = leg.get("executedSymbol", "")
+            if leg.get("isClosed", False) and not leg.get("exitFailed", False) and leg_sym:
+                cancel_pending_sl_orders_for_exited_leg(client, leg, leg_sym, strat_name=target_strat.get("name", "Strategy"))
 
     target_strat["finalMTM"] = round(total_realized_pnl, 2)
     target_strat["liveMTM"] = round(total_realized_pnl, 2)
