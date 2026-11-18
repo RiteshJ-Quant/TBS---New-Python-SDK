@@ -1501,32 +1501,46 @@ def is_transport_or_disconnect_error(response_or_exc) -> bool:
     return False
 
 
-def refresh_client_http_session(client) -> bool:
+HTTP_SESSION_LOCK = threading.Lock()
+LAST_SESSION_REFRESH_TIME = 0.0
+
+
+def refresh_client_http_session(client, force: bool = False, min_interval_sec: float = 0.25) -> bool:
     """
-    Closes the existing httpx session and recreates a fresh connection pool
-    to purge dead/stale HTTP/2 sockets after broker idle timeouts.
+    Thread-safe session refresh. Closes the existing httpx session and recreates a fresh
+    connection pool to purge dead/stale HTTP/2 sockets after broker idle timeouts.
+    Uses HTTP_SESSION_LOCK to prevent concurrent threads from racing or closing active sockets.
     """
+    global LAST_SESSION_REFRESH_TIME
     if client is None:
         return False
-    try:
-        rc = getattr(client, "api_client", None)
-        if rc and hasattr(rc, "rest_client"):
-            rc = rc.rest_client
-        elif hasattr(client, "rest_client"):
-            rc = client.rest_client
 
-        if rc and hasattr(rc, "session"):
-            try:
-                rc.session.close()
-            except Exception:
-                pass
-            if hasattr(rc, "_create_session"):
-                rc.session = rc._create_session()
-                print("[+] Refreshed Kotak Neo HTTP/2 session and connection pool.")
-                return True
-    except Exception as ex:
-        print(f"[-] Failed to refresh Kotak Neo HTTP session: {ex}")
-    return False
+    with HTTP_SESSION_LOCK:
+        now_ts = time.time()
+        # If another thread just refreshed the session within min_interval_sec, reuse the fresh session!
+        if not force and (now_ts - LAST_SESSION_REFRESH_TIME) < min_interval_sec:
+            return True
+
+        try:
+            rc = getattr(client, "api_client", None)
+            if rc and hasattr(rc, "rest_client"):
+                rc = rc.rest_client
+            elif hasattr(client, "rest_client"):
+                rc = client.rest_client
+
+            if rc and hasattr(rc, "session"):
+                try:
+                    rc.session.close()
+                except Exception:
+                    pass
+                if hasattr(rc, "_create_session"):
+                    rc.session = rc._create_session()
+                    LAST_SESSION_REFRESH_TIME = time.time()
+                    print("[+] Refreshed Kotak Neo HTTP/2 session and connection pool (thread-safe).")
+                    return True
+        except Exception as ex:
+            print(f"[-] Failed to refresh Kotak Neo HTTP session: {ex}")
+        return False
 
 
 def safe_place_order_with_retry(client, max_retries: int = 2, retry_delay: float = 0.25, **order_kwargs) -> dict:
@@ -2372,6 +2386,8 @@ def manual_entry_tbs_strategy():
                     sl_val = float(leg.get("slValue", 0) or 0)
                     sl_type = str(leg.get("slType", "Points (Pts)"))
                     if sl_enable and sl_val > 0:
+                        if idx > 0:
+                            time.sleep(idx * 0.075)  # 75ms stagger between parallel legs for SL orders
                         sl_trigger, sl_limit, sl_tx_type = calculate_sl_prices(
                             entry_price=option_ltp,
                             leg_action=leg_action,
@@ -2640,6 +2656,8 @@ def execute_strategy_entry(target_strat: dict) -> dict:
                     sl_type = str(leg.get("slType", "Points (Pts)"))
 
                     if sl_enable and sl_val > 0:
+                        if idx > 0:
+                            time.sleep(idx * 0.075)  # 75ms stagger between parallel legs for SL orders to prevent concurrent h2 stream collision
                         entry_price = leg_ltp
                         sl_trigger, sl_limit, sl_tx_type = calculate_sl_prices(
                             entry_price=entry_price,
@@ -2954,52 +2972,79 @@ def trigger_tbs_modify_stoploss_to_cost(target_strat: dict, hit_leg_idx: int, hi
             "WARN"
         )
 
-        if client is not None and rem_sl_order_no and not str(rem_sl_order_no).startswith("SIM-"):
-            try:
-                mod_res = safe_modify_order_with_retry(
-                    client,
-                    order_id=str(rem_sl_order_no),
-                    price=str(new_limit_price),
-                    order_type="SL",
-                    quantity=str(rem_qty),
-                    validity="DAY",
-                    trigger_price=str(new_trigger_price),
-                    disclosed_quantity="0",
-                    amo="NO"
+        if client is not None:
+            confirmed_id = None
+            strat_prod = get_strategy_product_code(target_strat)
+            sl_tx = "B" if rem_pos in ["SELL", "S"] else "S"
+            seg = "bse_fo" if sym_base in ["SENSEX", "BANKEX"] else "nse_fo"
+            if rem_symbol in SYMBOL_TO_TOKEN_MAP and SYMBOL_TO_TOKEN_MAP[rem_symbol][1]:
+                seg = SYMBOL_TO_TOKEN_MAP[rem_symbol][1]
+
+            # Path A: Modify existing broker SL order if present
+            if rem_sl_order_no and not str(rem_sl_order_no).startswith("SIM-"):
+                try:
+                    mod_res = safe_modify_order_with_retry(
+                        client,
+                        order_id=str(rem_sl_order_no),
+                        price=str(new_limit_price),
+                        order_type="SL",
+                        quantity=str(rem_qty),
+                        validity="DAY",
+                        trigger_price=str(new_trigger_price),
+                        disclosed_quantity="0",
+                        amo="NO"
+                    )
+                    if isinstance(mod_res, dict):
+                        confirmed_id = mod_res.get("nOrdNo") or mod_res.get("result")
+                        if not confirmed_id and mod_res.get("stat") == "Ok":
+                            confirmed_id = rem_sl_order_no
+                except Exception as me:
+                    log_system_event(f"Kotak Neo modify_order notice for Leg #{rem_idx+1}: {me}", "WARN")
+
+            # Path B (Self-Healing Fallback): If modification failed or no prior SL order existed on broker, place a fresh SL order at cost!
+            if not confirmed_id:
+                log_system_event(
+                    f"[FALLBACK SL PLACEMENT] Leg #{rem_idx+1} ({rem_symbol}) had no active broker SL order. Placing fresh Stop-Loss at Entry Cost ₹{new_trigger_price:.2f} on Kotak Neo...",
+                    "WARN"
                 )
-
-                confirmed_id = None
-                if isinstance(mod_res, dict):
-                    confirmed_id = mod_res.get("nOrdNo") or mod_res.get("result")
-                    if not confirmed_id and mod_res.get("stat") == "Ok":
-                        confirmed_id = rem_sl_order_no
-
-                if confirmed_id:
-                    rem_leg["slOrderNo"] = str(confirmed_id)
-                    rem_leg["slTriggerPrice"] = new_trigger_price
-                    rem_leg["slLimitPrice"] = new_limit_price
-                    rem_leg["slMovedToCost"] = True
-                    target_strat["slMovedToCost"] = True
-                    log_system_event(
-                        f"[MOVE SL TO COST SUCCESS] Leg #{rem_idx+1} ({rem_symbol}) Stop-Loss updated to Entry Cost ₹{new_trigger_price:.2f}! Broker Order: {confirmed_id}. Position shielded from reversal losses.",
-                        "SUCCESS"
+                try:
+                    place_res = safe_place_order_with_retry(
+                        client,
+                        exchange_segment=seg,
+                        trading_symbol=rem_symbol,
+                        transaction_type=sl_tx,
+                        product=strat_prod,
+                        order_type="SL",
+                        quantity=str(rem_qty),
+                        price=str(new_limit_price),
+                        trigger_price=str(new_trigger_price),
+                        validity="DAY"
                     )
-                else:
-                    err_msg = mod_res.get("errMsg") or mod_res.get("message") or mod_res if isinstance(mod_res, dict) else str(mod_res)
-                    log_system_event(
-                        f"Kotak Neo modify_order for Leg #{rem_idx+1} ({rem_symbol}): {err_msg}",
-                        "WARN"
-                    )
-                    rem_leg["slTriggerPrice"] = new_trigger_price
-                    rem_leg["slLimitPrice"] = new_limit_price
-                    rem_leg["slMovedToCost"] = True
-                    target_strat["slMovedToCost"] = True
-            except Exception as e:
-                log_system_event(f"Kotak Neo modify_order exception for Leg #{rem_idx+1}: {e}", "ERROR")
+                    if isinstance(place_res, dict):
+                        confirmed_id = place_res.get("nOrdNo") or place_res.get("result")
+                except Exception as pe:
+                    log_system_event(f"Fallback SL placement exception for Leg #{rem_idx+1}: {pe}", "ERROR")
+
+            if confirmed_id:
+                rem_leg["slOrderNo"] = str(confirmed_id)
+                rem_leg["slTriggerPrice"] = new_trigger_price
+                rem_leg["slLimitPrice"] = new_limit_price
+                rem_leg["slStatus"] = "PENDING"
+                rem_leg["slMovedToCost"] = True
+                target_strat["slMovedToCost"] = True
+                log_system_event(
+                    f"[MOVE SL TO COST SUCCESS] Leg #{rem_idx+1} ({rem_symbol}) Stop-Loss updated to Entry Cost ₹{new_trigger_price:.2f}! Broker Order: #{confirmed_id}. Position shielded from reversal losses.",
+                    "SUCCESS"
+                )
+            else:
                 rem_leg["slTriggerPrice"] = new_trigger_price
                 rem_leg["slLimitPrice"] = new_limit_price
                 rem_leg["slMovedToCost"] = True
                 target_strat["slMovedToCost"] = True
+                log_system_event(
+                    f"[MOVE SL TO COST LOCAL] Leg #{rem_idx+1} ({rem_symbol}) Stop-Loss moved to Entry Cost ₹{new_trigger_price:.2f} locally.",
+                    "WARN"
+                )
         else:
             # Paper trading / simulated mode
             rem_leg["slTriggerPrice"] = new_trigger_price
@@ -3086,29 +3131,32 @@ def poll_order_book_and_adjust_sl(strat_id: str):
                                 )
                                 trigger_tbs_modify_stoploss_to_cost(strat, idx, sl_ord_no)
                                 break
-            else:
-                # Simulated paper-trade monitoring
-                for idx, leg in enumerate(legs):
-                    if not leg.get("slHit", False) and leg.get("executedSymbol"):
-                        sym = leg["executedSymbol"]
-                        curr_ltp = float(OPTION_LIVE_PRICES.get(sym, leg.get("executedEntryPrice", 0)))
-                        pos = leg.get("position", "Sell").upper()
-                        sl_trig = float(leg.get("slTriggerPrice", 0))
-                        hit = False
-                        if pos in ["SELL", "S"] and sl_trig > 0 and curr_ltp >= sl_trig:
-                            hit = True
-                        elif pos in ["BUY", "B"] and sl_trig > 0 and curr_ltp <= sl_trig:
-                            hit = True
 
-                        if hit:
-                            leg["slHit"] = True
-                            leg["slStatus"] = "COMPLETE"
-                            log_system_event(
-                                f"[SIMULATED SL HIT] Leg #{idx+1} ({sym}) Stop-Loss triggered @ ₹{curr_ltp:.2f} (Trigger: ₹{sl_trig:.2f})! Executing Move SL to Cost for remaining leg(s)...",
-                                "WARN"
-                            )
-                            trigger_tbs_modify_stoploss_to_cost(strat, idx, "SIM-SL")
-                            break
+            # Hybrid Real-Time Fallback: Check Live WebSocket Tick Prices across both live and paper trading
+            for idx, leg in enumerate(legs):
+                if not leg.get("slHit", False) and leg.get("executedSymbol"):
+                    sym = leg["executedSymbol"]
+                    curr_ltp = float(OPTION_LIVE_PRICES.get(sym, 0.0))
+                    if curr_ltp <= 0:
+                        qual = preselect_qualifying_leg_contract(strat.get("symbol", "NIFTY"), leg, strategy_expiry=strat.get("strategyExpiry"))
+                        curr_ltp = float(qual.get("option_ltp", leg.get("executedEntryPrice", 0.0)))
+                    pos = leg.get("position", "Sell").upper()
+                    sl_trig = float(leg.get("slTriggerPrice", 0.0))
+                    hit = False
+                    if pos in ["SELL", "S"] and sl_trig > 0 and curr_ltp >= sl_trig:
+                        hit = True
+                    elif pos in ["BUY", "B"] and sl_trig > 0 and curr_ltp <= sl_trig:
+                        hit = True
+
+                    if hit:
+                        leg["slHit"] = True
+                        leg["slStatus"] = "COMPLETE"
+                        log_system_event(
+                            f"[HYBRID SL BREACH] Leg #{idx+1} ({sym}) crossed SL level @ ₹{curr_ltp:.2f} (Trigger: ₹{sl_trig:.2f})! Executing Move SL to Cost for remaining leg(s)...",
+                            "WARN"
+                        )
+                        trigger_tbs_modify_stoploss_to_cost(strat, idx, leg.get("slOrderNo", "PRICE_TRIGGER"))
+                        break
         except Exception:
             pass
 
@@ -3656,9 +3704,11 @@ def start_background_scheduler():
                                     if leg_pos in ["SELL", "S"]:
                                         if (current_ltp - leg_entry_p) >= max_allowed_loss_pts:
                                             any_leg_sl_hit = True
+                                            leg["slHit"] = True
                                     else:
                                         if (leg_entry_p - current_ltp) >= max_allowed_loss_pts:
                                             any_leg_sl_hit = True
+                                            leg["slHit"] = True
 
                         s["liveMTM"] = round(total_mtm, 2)
 
@@ -3728,9 +3778,11 @@ def start_background_scheduler():
                         if any_leg_sl_hit:
                             sq_type = s.get("squareOffType", "Partial")
                             if ("Partial" in sq_type or s.get("move_sl_to_cost")) and len(legs) > 1:
-                                # When Move SL to Cost or Partial square-off is enabled,
-                                # the 500ms poller monitors and adjusts the remaining leg to cost.
-                                pass
+                                if s.get("move_sl_to_cost") and not s.get("slMovedToCost", False):
+                                    for h_idx, h_leg in enumerate(legs):
+                                        if h_leg.get("slHit", False):
+                                            trigger_tbs_modify_stoploss_to_cost(s, h_idx, "LIVE_PRICE_BREACH")
+                                            break
                             else:
                                 log_system_event(f"LEG STOP LOSS HIT for '{s['name']}'! Squaring off...", "WARN")
                                 execute_strategy_exit(s, reason="LEG_STOPLOSS_HIT")
